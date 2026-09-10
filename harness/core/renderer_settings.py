@@ -6,6 +6,9 @@ segment cleanly — see rig/render.py `configure_render`). That single choice th
 ripples into every tool that later has to *present* a transparent render on some
 visible background:
 
+  * critic.py  — composites the match/turntable renders (and the masked source)
+                 onto ONE backdrop before sending them to the VLM, so a dark
+                 object never washes out on an uncontrolled background.
   * composite.py — paints its silhouette-overlap panel on that backdrop.
 
 Before this module each of those re-declared its own background colour and
@@ -30,7 +33,7 @@ FILM_TRANSPARENT = True
 
 
 # --------------------------------------------------------------------------- #
-# present-time backdrop (consumed by composite.py)
+# present-time backdrop (consumed by critic.py / composite.py)
 # --------------------------------------------------------------------------- #
 # The uniform solid backdrop a transparent render is composited onto when a tool
 # wants a controlled, opaque background (BGR). Swap here to change it everywhere.

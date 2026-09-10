@@ -53,7 +53,7 @@ named `apply.*`. Use `apply` when you already know the move you want to *check*;
 harness/render.sh RUN_DIR/scene.py RUN_DIR/views --views apply \
     --match-res IMAGE --sweep-mask MASK --apply 'yaw:90'
 
-# a visually directed pitch + a hinge opening on a specific frame, depth-aware:
+# a critic-directed pitch + a hinge opening on a specific frame, depth-aware:
 harness/render.sh RUN_DIR/scene.py RUN_DIR/views --views apply \
     --frame 000040.jpg --match-res IMAGE --sweep-mask MASK --tracking CAPTURE/tracking \
     --apply 'pitch:17;dpx:0.05;door_hinge:70'

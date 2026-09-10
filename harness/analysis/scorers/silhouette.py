@@ -14,11 +14,11 @@ The gate IoU.
   therefore the raw pixel IoU (`iou_raw`) — placement, scale, and proportions all
   count. IoU is silhouette-only and depth-blind, so it does NOT tell you whether a
   low score is a shape or a pose error: that call is the agent's, from the
-  turntable (coherence), source/render comparisons, and `aspect_ratio_source`
+  turntable (coherence), the VLM critic's tagged fixes, and `aspect_ratio_source`
   vs `aspect_ratio_render` (proportion) — see AGENT_TASK.md "Shape vs. pose vs.
   articulation". (`aspect_ratio` is reported as a proportion hint; there is no
   bbox-normalized "shape-only" IoU — a normalized number invited deciding shape
-  from a metric instead of visual evidence.)
+  from a metric instead of from the turntable + critic.)
 
 CLI (pass --source to also get the RGB color residual):
   micromamba run -n artscript python -m analysis.scorers.silhouette \
@@ -179,7 +179,7 @@ def silhouette_iou(mask, render_mask,
         # hand). The gate when no hand is present; a diagnostic once a hand is
         # (iou_visible becomes the gate then). IoU is depth-blind and does not
         # distinguish a shape error from a pose error — read it beside the
-        # turntable + source/render comparisons + the aspect-ratio hint to make that
+        # turntable + the VLM critic + the aspect-ratio hint (below) to make that
         # call (see AGENT_TASK.md "Shape vs. pose vs. articulation").
         "iou_raw": round(iou(m, rm), 4),
         # Proportion hint: width/height of each tight silhouette bbox. A source

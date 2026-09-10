@@ -57,7 +57,7 @@ for the usual `limit: (0, 180)` hinge that is **both endpoints**.
 A book cover authored to open *backwards through its own pages* renders
 **pixel-identically** to a correct one at 0° and at 180°. Those are also the two
 states an agent verifies hardest, because they are the legible extremes. So
-silhouette IoU, the side-by-side, and the turntable **all agree**, and
+silhouette IoU, the side-by-side, the critic and the turntable **all agree**, and
 the error survives review. It shows only in the intermediate angles, which is
 where an agent is least confident anyway — so the mismatch gets attributed to pose
 and chased with sweeps that can never fix it.

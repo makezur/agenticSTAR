@@ -39,7 +39,9 @@ Options:
   -h, --help          Show this help
 
 Export ANTHROPIC_API_KEY once before running this; it is stored in the state
-directory (mode 0600) and never written into the checkout.
+directory (mode 0600) and never written into the checkout. Export OPENAI_API_KEY
+as well to let the VLM critic run on OpenAI inside Claude runs
+(harness/analysis/scorers/critic/critic.md).
 EOF
 }
 
@@ -280,6 +282,17 @@ elif [[ ! -s "$CLAUDE_STATE/$CLAUDE_API_KEY_FILE" ]]; then
 fi
 # The key is provisioning input, not runtime configuration.
 unset ANTHROPIC_API_KEY
+
+# Optional: an OpenAI key for the harness's VLM critic (--critic-provider openai).
+# Stored beside the Anthropic key; the launcher exports it into the sandbox and
+# allows api.openai.com only when this file exists.
+if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+  umask 077
+  printf '%s\n' "$OPENAI_API_KEY" > "$CLAUDE_STATE/openai_api_key"
+  umask 022
+  echo "Stored an OpenAI key for the VLM critic: $CLAUDE_STATE/openai_api_key"
+fi
+unset OPENAI_API_KEY
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-articulated"
 mkdir -p "$CONFIG_DIR"

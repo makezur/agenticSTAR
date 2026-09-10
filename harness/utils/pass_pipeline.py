@@ -3,7 +3,7 @@
 This module owns only the neutral mechanics: resolve a multi-frame layout,
 invoke ``render.sh`` into an iteration-owned pass directory, and construct the
 standard per-frame composite command. Shape-only policy such as turntables,
-depth scoring, aggregation, and finalization stays in ``shape_pass``.
+depth scoring, critics, aggregation, and finalization stays in ``shape_pass``.
 """
 
 from collections import deque

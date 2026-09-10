@@ -187,6 +187,14 @@ done
 grep -q '"OPENAI_API_KEY"' "$HOST_CODEX_HOME/auth.json" 2>/dev/null ||
   die "$HOST_CODEX_HOME/auth.json has no API-key login.
 Export OPENAI_API_KEY and rerun tools/install_codex_bwrap.sh once to provision it."
+# Optional second key for the harness's VLM critic (harness/analysis/scorers/critic)
+# when it runs on Anthropic: tools/install_codex_bwrap.sh stores $ANTHROPIC_API_KEY
+# here when it is exported at setup. Present -> exported into the sandbox and
+# api.anthropic.com joins the egress allowlist; absent -> nothing changes.
+CRITIC_ANTHROPIC_KEY=""
+if [[ -s "$HOST_CODEX_HOME/anthropic_api_key" ]]; then
+  CRITIC_ANTHROPIC_KEY="$(head -n1 "$HOST_CODEX_HOME/anthropic_api_key")"
+fi
 
 SANDBOX_PROJECT="/home/ubuntu/articulated_script"
 SANDBOX_BLENDER="/home/ubuntu/blender"
@@ -266,6 +274,7 @@ if [[ "$SANDBOX_NET" == allowlist ]]; then
     mapfile -t egress_hosts < <(
       codex_provider_egress_hosts "$CODEX_PROVIDER"
     )
+    [[ -z "$CRITIC_ANTHROPIC_KEY" ]] || egress_hosts+=("api.anthropic.com:443")
   else
     read -r -a egress_hosts <<< "$SANDBOX_EGRESS_HOSTS"
   fi
@@ -768,6 +777,8 @@ bwrap_args+=(
   --chdir "$sandbox_cwd"
 )
 bwrap_args+=(--setenv ARTSCRIPT_CODEX_PROVIDER "$CODEX_PROVIDER")
+[[ -z "$CRITIC_ANTHROPIC_KEY" ]] ||
+  bwrap_args+=(--setenv ANTHROPIC_API_KEY "$CRITIC_ANTHROPIC_KEY")
 
 if [[ "${1:-}" == "--check-isolation" ]]; then
   "${netns_prefix[@]}" "${proc_prefix[@]}" bwrap "${bwrap_args[@]}" /bin/bash -ceuo pipefail '

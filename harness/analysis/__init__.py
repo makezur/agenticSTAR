@@ -11,8 +11,8 @@ Blender. Layered as a downward DAG so the pieces stay coherent:
                  (`rasters`), panel drawing (`panels`), observed-depth loaders
                  (`depth_obs`),
                  JSON + filename conventions + shared argparse blocks (`io`).
-  * `scorers/` — per-frame scoring: `silhouette` (the IoU gate) and `depth`
-                 (rendered-vs-observed depth agreement).
+  * `scorers/` — per-frame scoring: `silhouette` (the IoU gate), `depth`
+                 (rendered-vs-observed depth agreement), `critic` (VLM judge).
   * `viz/`     — visualization panels: `composite`, sheets, `sweep_sides`.
   * `rollup/`  — cross-frame roll-up: `aggregate`.
   * `temporal/` — motion through time on top of `pose_diff`: `report` (THE entry

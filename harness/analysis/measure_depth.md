@@ -151,9 +151,9 @@ which-way-does-it-point hint. Poses are authored as scalar-first **quaternions**
    `base.canonical_ratios`, and render with `--tracking` (each frame's K applied
    automatically) or `--intrinsics <base.intrinsics_for_render>`.
 2. Refine each frame's rotation: eyeball the `match` view, or run a wide-range `sweep`
-   with `--sweep-dump-topk` and pick the orientation from the `sweep_top_*.png`
-   contact sheet. If the images show a **re-grip**, set `moved=True` and
-   re-orient; if they show **articulation**, add a `JOINT` and leave the base pose.
+   with `--sweep-dump-topk` and pick the orientation from the `sweep_top_*.png` contact
+   sheet. For a frame the critic flags as a **re-grip**, set `moved=True` and re-orient;
+   if it's **articulation**, add a `JOINT` and leave the base pose.
 3. **Verify with [`depth.py`](scorers/depth.md)** per frame — aim for a small `depth_mae_canon`
    and a near-zero `depth_bias_canon` (translation-Z / scale already
    right); iterate rotation, then fine-tune.

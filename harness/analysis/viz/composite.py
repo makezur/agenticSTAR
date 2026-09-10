@@ -58,9 +58,10 @@ from analysis.viz import depth_units, rows
 from core import renderer_settings
 
 
-# The overlap colours + their legend live in `lib.panels` (the one owner shared
-# with the candidate sheets) and the row assembly in `viz.rows`. Re-exported
-# here under their original names for readers and docs.
+# The overlap colours + their legend live in `lib.panels` (the one owner, shared
+# with the candidate sheets and the critic prompt) and the row assembly in
+# `viz.rows`. Re-exported here under their original names: this module is where
+# readers, the critic, and the docs have always looked them up.
 OVL_AGREE = panels.OVL_AGREE
 OVL_EXTRA = panels.OVL_EXTRA
 OVL_MISSING = panels.OVL_MISSING

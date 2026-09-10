@@ -30,6 +30,7 @@ options:
   --agent-retries N       agent restarts after the initial attempt
   --codex-provider NAME   Codex provider (openai)
   --claude-provider NAME  Claude provider (anthropic)
+  --critic-provider NAME  VLM critic backend: auto (default), anthropic or openai
   --enable MODULE         turn an optional harness module on for every run
   --disable MODULE        turn an optional harness module off (e.g. mechanism)
   --candidate-sheet-max-dimension N
@@ -47,6 +48,7 @@ AGENT_RETRIES=""
 CODEX_PROVIDER="${ARTSCRIPT_CODEX_PROVIDER:-}"
 AGENT="${ARTSCRIPT_AGENT:-}"
 CLAUDE_PROVIDER="${ARTSCRIPT_CLAUDE_PROVIDER:-}"
+CRITIC_PROVIDER="${ARTSCRIPT_CRITIC_PROVIDER:-}"
 ENABLE_MODULES=()
 DISABLE_MODULES=()
 CANDIDATE_SHEET_MAX_DIMENSION=""
@@ -90,6 +92,11 @@ while [ "$#" -gt 0 ]; do
     --claude-provider)
       [ "$#" -ge 2 ] || { echo "error: --claude-provider requires anthropic" >&2; exit 2; }
       CLAUDE_PROVIDER="$2"
+      shift 2
+      ;;
+    --critic-provider)
+      [ "$#" -ge 2 ] || { echo "error: --critic-provider requires auto, anthropic or openai" >&2; exit 2; }
+      CRITIC_PROVIDER="$2"
       shift 2
       ;;
     --candidate-sheet-max-dimension)
@@ -229,6 +236,7 @@ PY
   [ -z "$CODEX_PROVIDER" ] || agent_args+=(--codex-provider "$CODEX_PROVIDER")
   [ -z "$AGENT" ] || agent_args+=(--agent "$AGENT")
   [ -z "$CLAUDE_PROVIDER" ] || agent_args+=(--claude-provider "$CLAUDE_PROVIDER")
+  [ -z "$CRITIC_PROVIDER" ] || agent_args+=(--critic-provider "$CRITIC_PROVIDER")
   for name in ${ENABLE_MODULES[@]+"${ENABLE_MODULES[@]}"}; do agent_args+=(--enable "$name"); done
   for name in ${DISABLE_MODULES[@]+"${DISABLE_MODULES[@]}"}; do agent_args+=(--disable "$name"); done
   [ -z "$CANDIDATE_SHEET_MAX_DIMENSION" ] || agent_args+=(--candidate-sheet-max-dimension "$CANDIDATE_SHEET_MAX_DIMENSION")

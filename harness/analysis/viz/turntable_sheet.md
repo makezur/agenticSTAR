@@ -54,7 +54,7 @@ is a filename, not a manifest lookup. A rigid object with no joints yields a sin
   header bar taller — the bar is stacked above the picture, never over it (the
   alignment invariant in [`../lib/panels.py`](../lib/panels.py)).
 - `--bg-mode alpha|black`: backdrop for the transparent renders; default `black`,
-  matching the standard comparison panels.
+  matching what the VLM critic is fed.
 - `--run-dir DIR`: run whose `layout.json` locates the source photos for the
   reference tile.
 - `--frames-dir DIR`: source photos directory; overrides the layout path.
@@ -70,7 +70,8 @@ viewpoint, rather than to "the third picture on the second row".
 
 A sheet is an **index, not an archive**. The individual
 `turntable_<state>_az<AAA>_el<±EE>.png` renders stay in the pass dir: that is what
-you open when a region needs full-resolution pixels. The manifest records the glob
+[`critic.py`](../scorers/critic/critic.md) feeds a VLM at full resolution, and what
+you open when a region needs pixels. The manifest records the glob
 (`turntable_*_az*_el*.png`) for exactly that reason.
 
 ## Why this is not a `viz.rows` sheet

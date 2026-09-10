@@ -138,7 +138,7 @@ def configure_render(args):
     # Transparent film -> the alpha channel is an exact object silhouette,
     # independent of the object's color (so dark parts still segment cleanly).
     # The flag lives in core.renderer_settings, shared with the tools that later
-    # present these transparent renders on a backdrop in visual composites.
+    # present these transparent renders on a backdrop (critic/composite).
     scene.render.film_transparent = renderer_settings.FILM_TRANSPARENT
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGBA"

@@ -4,12 +4,13 @@
 Run in the 'artscript' micromamba env (use the harness/utils/shape_pass.sh wrapper):
   harness/utils/shape_pass.sh RUN_DIR --frames 000000.jpg,000040.jpg
   harness/utils/shape_pass.sh RUN_DIR                    # frames from layout.json
-  harness/utils/shape_pass.sh RUN_DIR --pass-label shape-checkpoint
+  harness/utils/shape_pass.sh RUN_DIR --pass-label shape-checkpoint \
+      --critic-frames 000000.jpg
 
 This is the main beat of the SHAPE loop: author `scene.py`, render, look, repeat.
 It produces the full diagnostic set for the committed state on every frame.
 Pose windows normally use the lighter `composite_pass.sh` after apply; run this
-full pass there only when turntables, depth, mechanism views, aggregate,
+full pass there only when turntables, depth, mechanism views, critics, aggregate,
 or self-intersection are deliberately needed.
 
 The pass itself is a fixed sequence: render.sh (match,turntable,depth) -> then,
@@ -36,9 +37,15 @@ What it runs, in order:
      aggregate.py reads; the manual step-4 composite command never writes it).
   3. self_intersection.py on the pass's OWN pose.json + the GLB it just exported —
      UNCONDITIONAL, every pass, no flag to skip it (see run_self_intersection).
-  4. unless --no-aggregate: aggregate.py --run-dir RUN_DIR --views-dir PASS_DIR.
-  5. prints a per-frame summary read back from the JSON: the iou_raw / depth_mae_canon
-     table and a SELF-INTERSECTION block (deepest part-pair overlap + the onsets).
+  4. critic.py for explicitly selected screening frames (soft; a non-zero exit is
+     tolerated); a routine pass makes no VLM calls. Use --critic-frames for a
+     coverage/suspect set or --critic-all for a deliberate checkpoint.
+  5. unless --no-aggregate: aggregate.py --run-dir RUN_DIR --views-dir PASS_DIR.
+  6. prints a per-frame summary read back from the JSON: the iou_raw / depth_mae_canon
+     table, a SELF-INTERSECTION block (deepest part-pair overlap + the onsets), AND
+     a VLM critic block (realism/identity + every discrepancy — all severities, any
+     tag — with HIGH marked) so the critic's shape/pose/joint verdict is visible
+     inline at decision time, not buried in critic_<frame>.json.
 """
 
 import argparse
@@ -54,6 +61,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # cwd=HARNESS so `analysis` (and the shared `core`) resolve.
 HARNESS = os.path.join(REPO, "harness")
 DEPTH = "analysis.scorers.depth"
+CRITIC = "analysis.scorers.critic"
 AGGREGATE = "analysis.rollup.aggregate"
 TURNTABLE_SHEET = "analysis.viz.turntable_sheet"
 MECHANISM_SHEET = "analysis.viz.mechanism_sheet"
@@ -93,8 +101,8 @@ def log(msg):
 # --------------------------------------------------------------------------- #
 def resolve_config(run_dir, args):
     """Fold RUN_DIR/run_config.json into `args` in place: resolve the
-    concurrency knobs (N/G), the pool toggle/gpus and bg_mode. Config-settable
-    flags parsed with a None default mean 'not
+    concurrency knobs (N/C/G), the pool toggle/gpus, bg_mode, and the critic
+    backend block. Config-settable flags parsed with a None default mean 'not
     passed on the CLI' -> fall through to the config value, then the built-in
     default. An absent/corrupt config leaves the built-in defaults, so older runs
     (no config file) behave exactly as before."""
@@ -102,8 +110,10 @@ def resolve_config(run_dir, args):
     conc = icfg.section(cfg, "concurrency")
     pool = icfg.section(cfg, "pool")
     visuals = icfg.section(cfg, "visuals")
+    critic = icfg.section(cfg, "critic")
 
     args.ncpu = icfg.pick(args.ncpu, conc, "ncpu", min(4, os.cpu_count() or 1))
+    args.critic_conc = icfg.pick(args.critic_conc, conc, "critic_conc", 8)
     args.workers = icfg.pick(args.workers, conc, "workers", 2)
     args.pool = bool(icfg.pick(args.pool, pool, "enable", False))
     args.archive_spool = bool(icfg.pick(args.archive_spool, pool,
@@ -136,6 +146,19 @@ def resolve_config(run_dir, args):
             os.path.join(run_dir, "depth_config.json"))
     else:
         args.depth_render = bool(args.depth_render)
+
+    # The critic backend block: keep values that stay None as None so
+    # _critic_backend_flags omits them (critic.py falls back to its own default).
+    args.critic = {
+        k: icfg.pick(getattr(args, a), critic, k, None)
+        for k, a in (("provider", "provider"), ("model", "model"),
+                     ("api_key_env", "api_key_env"),
+                     ("max_tokens", "max_tokens"),
+                     ("pass_realism", "pass_realism"),
+                     ("pass_identity", "pass_identity"),
+                     ("max_turntable", "max_turntable"),
+                     ("crops", "crops"), ("crop_pad", "crop_pad"))
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -288,7 +311,7 @@ def run_render_pool(run_dir, layout, args):
       2. POOL: spawn a throwaway pool (--once-empty-exit) and submit one
          match+depth order per frame; G resident workers drain them in parallel.
       3. RECONCILE: copy each order's match_<stem>.png / depth_<stem>.npy into the
-         gauge PASS_DIR, so _frame_paths / _score_cpu / read_scale
+         gauge PASS_DIR, so _frame_paths / _score_cpu / _score_critic / read_scale
          see the single-pass-dir layout they already assume — no downstream change.
     """
     frames = layout["frames"]
@@ -403,7 +426,7 @@ def read_scale(run_dir, pass_dir):
 def _frame_paths(pass_dir, layout, frame, depth_report=True):
     """The full bundle of PASS_DIR paths + inputs for one frame, derived ONCE from
     the frame stem so the pass number can't drift between them. Pure — no side
-    effects — so every scorer can call it and agree byte-for-
+    effects — so _score_cpu and _score_critic can each call it and agree byte-for-
     byte on every path they touch.
 
     `depth_report` (depth_config.json "report" flip switch, default on) gates
@@ -418,6 +441,7 @@ def _frame_paths(pass_dir, layout, frame, depth_report=True):
         "depth_residual": os.path.join(
             pass_dir, f"depth_residual_{paths['stem']}.png"),
         "depth_json": os.path.join(pass_dir, f"depth_{paths['stem']}.json"),
+        "critic_out": os.path.join(pass_dir, f"critic_{paths['stem']}.json"),
         "has_depth": (depth_report and bool(layout["tracking"])
                       and os.path.isfile(render_depth)),
         "has_render_depth": os.path.isfile(render_depth),
@@ -425,12 +449,14 @@ def _frame_paths(pass_dir, layout, frame, depth_report=True):
     return paths
 
 
-def _score_cpu(run_dir, pass_dir, layout, frame, args, scale):
+def _score_cpu(run_dir, pass_dir, layout, frame, args, scale,
+               screen_critic=False):
     """The CPU, HARD-FAIL half of scoring one frame: composite.py (metrics +
     overlap) then depth.py (depth_<stem>.json). A failure here raises
     SystemExit — inside a worker thread that becomes the future's exception, which
     the dispatcher re-raises to abort the whole pass (a broken composite/depth is
-    not something to score around). Returns the result dict."""
+    not something to score around). Returns the result dict; the `critic` path is
+    filled deterministically so _score_critic just has to write to it."""
     p = _frame_paths(pass_dir, layout, frame, args.depth_report)
     stem = p["stem"]
 
@@ -473,27 +499,132 @@ def _score_cpu(run_dir, pass_dir, layout, frame, args, scale):
         log(f"{stem}: no observed/rendered depth — skipping depth score")
 
     return {"frame": frame, "metrics": p["metrics_out"],
-            "depth": p["depth_json"] if p["has_depth"] else ""}
+            "depth": p["depth_json"] if p["has_depth"] else "",
+            "critic": p["critic_out"] if screen_critic else ""}
 
+
+
+# The critic backend settings (provider/model/thresholds) live in the resolved
+# critic config (CLI flag > run_config.json > critic.py's own default). Each is
+# appended ONLY when set — an unset value is omitted so critic.py falls back to its
+# own default (provider auto / per-provider model / max-tokens 6000 / ...).
+def _critic_backend_flags(critic_cfg):
+    """CLI args to append to a `python -m analysis.scorers.critic` command from the
+    resolved critic config dict (values may be None = 'use critic.py's default')."""
+    flags = []
+    for key, flag in (("provider", "--provider"), ("model", "--model"),
+                      ("api_key_env", "--api-key-env"),
+                      ("max_tokens", "--max-tokens"),
+                      ("pass_realism", "--pass-realism"),
+                      ("pass_identity", "--pass-identity"),
+                      ("max_turntable", "--max-turntable"),
+                      ("crop_pad", "--crop-pad")):
+        v = critic_cfg.get(key)
+        if v is not None and v != "":
+            flags += [flag, str(v)]
+    if critic_cfg.get("crops"):          # store_true on critic.py — presence only
+        flags.append("--crops")
+    return flags
+
+
+def _score_critic(run_dir, pass_dir, layout, frame, args):
+    """The NETWORK, SOFT half of scoring one frame: critic.py. Runs after the
+    frame's composite (it reads overlap_<stem>.png). Soft — a non-zero exit is
+    tolerated; skips cleanly (exit 0, writes nothing) with no VLM creds. Writes to
+    the same critic_<stem>.json _score_cpu already put in the result dict."""
+    p = _frame_paths(pass_dir, layout, frame, args.depth_report)
+    stem = p["stem"]
+    crit = ["python", "-m", CRITIC,
+            "--source", p["img"], "--render", p["match"],
+            "--overlap", p["overlap_out"],
+            "--turntable", os.path.join(pass_dir, turntable_views.IMAGE_GLOB),
+            "--bg-mode", args.bg_mode, "--mask", p["mask"],
+            "--frame", stem, "--pose", os.path.join(pass_dir, "pose.json"),
+            "--out", p["critic_out"]]
+    if p["hand"]:
+        crit += ["--hand-mask", p["hand"]]
+    # numeric grounding is OFF by default (it can confuse the visual judge);
+    # opt in with --critic-ground to feed this frame's metrics/depth.
+    if args.critic_ground:
+        if os.path.isfile(p["metrics_out"]):
+            crit += ["--metrics", p["metrics_out"]]
+        if p["has_depth"] and os.path.isfile(p["depth_json"]):
+            crit += ["--depth", p["depth_json"]]
+    crit += _critic_backend_flags(getattr(args, "critic", {}) or {})
+    _run_analysis(crit, f"critic {stem}", soft=True)
+    _stamp_critic_output(p["critic_out"], pass_dir)
+
+
+def _stamp_critic_output(path, pass_dir):
+    """Attach render-pass freshness metadata to a pass-driven critic result."""
+    critic = _load_json(path)
+    if critic is None:
+        return
+    manifest = _load_json(os.path.join(pass_dir, "MANIFEST.json")) or {}
+    critic["screening"] = {
+        "pass": os.path.basename(pass_dir.rstrip(os.sep)),
+        "scene_sha1": manifest.get("scene_sha1"),
+    }
+    with open(path, "w") as f:
+        json.dump(critic, f, indent=2)
+        f.write("\n")
+
+
+def select_critic_frames(args, frames):
+    """Resolve the explicit VLM screening policy for this pass.
+
+    The routine default is empty. ``--critic-frames`` screens a known coverage or
+    suspect set; ``--critic-all`` is reserved for deliberate checkpoints.
+    ``--no-critic`` remains as a compatibility spelling for the default.
+    """
+    requested = [f.strip() for f in
+                 str(getattr(args, "critic_frames", "") or "").split(",")
+                 if f.strip()]
+    all_frames = bool(getattr(args, "critic_all", False))
+    disabled = bool(getattr(args, "no_critic", False))
+    if disabled and (all_frames or requested):
+        raise SystemExit("[shape-pass] --no-critic cannot be combined with "
+                         "--critic-frames/--critic-all")
+    if all_frames and requested:
+        raise SystemExit("[shape-pass] choose either --critic-frames or --critic-all")
+    unknown = [f for f in requested if f not in frames]
+    if unknown:
+        raise SystemExit("[shape-pass] critic frame(s) not in the rendered layout: "
+                         + ", ".join(unknown))
+    return set(frames if all_frames else requested)
 
 
 def score_frames(run_dir, pass_dir, layout, args, scale):
-    """Score every frame numerically (composite + depth), N frames at a time."""
+    """Score every frame numerically, then VLM-screen only selected frames."""
     frames = layout["frames"]
+    critic_frames = getattr(args, "selected_critic_frames", None)
+    if critic_frames is None:
+        critic_frames = select_critic_frames(args, frames)
     results = {}
-    with ThreadPoolExecutor(max_workers=args.ncpu) as cpu:
+    with ThreadPoolExecutor(max_workers=args.ncpu) as cpu, \
+         ThreadPoolExecutor(max_workers=args.critic_conc) as net:
         cpu_futs = {
-            cpu.submit(_score_cpu, run_dir, pass_dir, layout, fr, args, scale): fr
+            cpu.submit(_score_cpu, run_dir, pass_dir, layout, fr, args, scale,
+                       fr in critic_frames): fr
             for fr in frames
         }
+        critic_futs = []
         try:
             for fut in as_completed(cpu_futs):
                 fr = cpu_futs[fut]
                 results[fr] = fut.result()   # re-raises composite/depth SystemExit
+                if results[fr].get("critic"):
+                    critic_futs.append(net.submit(_score_critic, run_dir, pass_dir,
+                                                  layout, fr, args))
         except BaseException:
             # a CPU worker hard-failed — cancel everything still queued and abort.
             cpu.shutdown(wait=False, cancel_futures=True)
+            net.shutdown(wait=False, cancel_futures=True)
             raise
+        # drain the critic futures (soft — _score_critic does not raise on a critic
+        # failure; result() surfaces only an unexpected dispatcher-side bug).
+        for fut in as_completed(critic_futs):
+            fut.result()
     return [results[fr] for fr in frames]   # RE-SORT to layout order
 
 
@@ -579,7 +710,7 @@ def _self_intersection_lines(report):
     in the temporal report), and any part excluded as non-watertight.
 
     A few lines only; the full table sits beside it in the pass dir. Printed inline
-    so an overlap is SEEN at decision time rather than left in a file."""
+    so an overlap is SEEN at decision time — same reason as the critic's verdict."""
     if report is None:
         return ["[shape-pass]   (no report — see the self-intersection output above)"]
     frames = report.get("frames") or []
@@ -673,6 +804,44 @@ def _load_json(path):
         return d if isinstance(d, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _critic_lines(frame, critic_path):
+    """Lines summarizing this frame's VLM critic verdict for the pass summary.
+
+    The critic (critic.py) writes realism/identity scores, a one-line summary, and
+    a ranked `discrepancies` list — each tagged shape/pose/joint with a severity.
+    We surface it inline so the agent SEES it when deciding the next move, instead
+    of having to open critic_<frame>.json by hand. We print EVERY discrepancy
+    (high/med/low, any tag) in the critic's own biggest-first order, so no signal is
+    hidden; HIGH-severity fixes (ANY tag) are marked ⚠ because those are the
+    reconcile-before-finalize items (aggregate.py's FINALIZE REVIEW REQUIRED).
+    Degrades gracefully: a missing file / an error status / no creds prints a single
+    skipped line and never crashes."""
+    c = _load_json(critic_path)
+    if c is None or c.get("status") == "error":
+        return [f"[shape-pass]   {frame}: critic (skipped — no verdict this pass)"]
+
+    def fnum(v):
+        return f"{v:.2f}" if isinstance(v, (int, float)) else "-"
+    head = (f"[shape-pass]   {frame}: realism={fnum(c.get('realism'))} "
+            f"identity={fnum(c.get('identity'))} — {c.get('summary') or ''}".rstrip())
+    out = [head]
+
+    ds = [d for d in (c.get("discrepancies") or []) if isinstance(d, dict)]
+    if not ds:
+        out.append("[shape-pass]     (no fixes — critic clean)")
+        return out
+    for d in ds:  # biggest-first order the critic returned; show all severities
+        sev = str(d.get("severity", "")).strip().lower() or "?"
+        tag = str(d.get("tag", "?")).strip().lower() or "?"
+        part = str(d.get("part", "?")).strip() or "?"
+        adj = (d.get("adjustment") or d.get("observation") or "").strip()
+        # HIGH fixes are the gating ones — mark them so they stand out from the
+        # advisory med/low notes.
+        marker = "⚠ HIGH" if sev == "high" else f"· {sev}"
+        out.append(f"[shape-pass]     {marker} {tag}/{part}: {adj}")
+    return out
 
 
 def _resolve_parent_snapshot(root, parent):
@@ -782,6 +951,19 @@ def print_summary(pass_dir, scored, self_intersection=None):
               "drove the parts together). A WARNING, not a gate: a modelled "
               "contact is fine once you can name it.")
 
+    # VLM critic — an explicit checkpoint/escalation screen, surfaced inline when
+    # requested so its shape/pose/joint finding can route the next round.
+    if any(s.get("critic") for s in scored):
+        print("[shape-pass]")
+        print("[shape-pass] VLM screening (selected frames only):")
+        for s in scored:
+            if s.get("critic"):
+                for line in _critic_lines(s["frame"], s["critic"]):
+                    print(line)
+        print("[shape-pass]   -> HIGH fixes (ANY tag) must be reconciled before finalize. "
+              "A pose `sweep` CANNOT fix a `shape` flag — fix it in build() first; "
+              "sweeping against wrong geometry just entrenches it.")
+
     # the strip is `composite.side_by_side_panel` (see the --side-by-side-out arg
     # built above), so this names ITS columns in ITS order: SOURCE | RENDER |
     # MASKED SOURCE (`match` survives only as a column ALIAS).
@@ -834,8 +1016,21 @@ def main():
     p.add_argument("--existing-pass", default="",
                    help="score and complete an existing render pass below the "
                         "currently open iteration without rerendering")
+    p.add_argument("--no-critic", action="store_true",
+                   help="make no VLM calls (compatibility flag; this is the default)")
+    p.add_argument("--critic-frames", default="",
+                   help="comma list of rendered frames to VLM-screen; routine "
+                        "iterations screen none")
+    p.add_argument("--critic", "--critic-all", dest="critic_all",
+                   action="store_true",
+                   help="VLM-screen every rendered frame at a deliberate checkpoint")
+    p.add_argument("--critic-ground", action="store_true",
+                   help="feed the critic numeric grounding (metrics/depth) for each "
+                        "frame; OFF by default (grounding can confuse the visual "
+                        "judge — it stays an independent image-only critic unless "
+                        "you opt in)")
     p.add_argument("--bg-mode", default=None, choices=["alpha", "black"],
-                   help="backdrop the composites use for match/turntable/masked-source "
+                   help="backdrop the composites and the critic use for match/turntable/masked-source "
                         "panels: 'black' (default, uniform — dark objects stay visible) "
                         "or 'alpha' (keep the renders' transparent film)")
     p.add_argument("--engine", default="BLENDER_EEVEE_NEXT",
@@ -921,6 +1116,10 @@ def main():
                    help="N — CPU scoring workers (concurrent composite+depth "
                         "subprocesses; default min(4, cpu_count); 1 = serial, "
                         "reproduces the old behavior). Config: concurrency.ncpu")
+    p.add_argument("--critic-conc", type=int, default=None,
+                   help="C — VLM critic workers (concurrent critic.py subprocesses; "
+                        "network-bound; default 8; 1 = serial). Config: "
+                        "concurrency.critic_conc")
     # --- resident-pool rendering (opt-in; cold render.sh is the default) ---------
     p.add_argument("--pool", action=argparse.BooleanOptionalAction, default=None,
                    help="render per-frame match/depth through the resident pool "
@@ -947,6 +1146,39 @@ def main():
                    help="how many spool archives to retain, oldest pruned first "
                         "(default 8; 0 = keep every archive forever). Config: "
                         "pool.keep_spools")
+    # --- VLM critic backend — CLI flag > run_config.json > critic.py default -
+    # Each stays None when unset so critic.py's own default applies. Config: the
+    # `critic` block. See analysis/scorers/critic/critic.md for meaning.
+    p.add_argument("--provider", default=None,
+                   choices=["auto", "anthropic", "openai"],
+                   help="VLM backend for the critic (default auto: whichever API key "
+                        "is available). Config: critic.provider")
+    p.add_argument("--model", default=None,
+                   help="critic model id override (default per provider). Config: "
+                        "critic.model")
+    p.add_argument("--api-key-env", default=None,
+                   help="env var holding the API key for the critic. Config: "
+                        "critic.api_key_env")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="critic max output tokens (default 6000). Config: "
+                        "critic.max_tokens")
+    p.add_argument("--pass-realism", type=float, default=None,
+                   help="critic realism soft-gate (default 0.7). Config: "
+                        "critic.pass_realism")
+    p.add_argument("--pass-identity", type=float, default=None,
+                   help="critic identity soft-gate (default 0.7). Config: "
+                        "critic.pass_identity")
+    p.add_argument("--max-turntable", type=int, default=None,
+                   help="cap on turntable images sent to the critic (default 16). "
+                        "Spent across articulation states, so a capped screen drops "
+                        "angles rather than hiding a configuration. "
+                        "Config: critic.max_turntable")
+    p.add_argument("--crops", action=argparse.BooleanOptionalAction, default=None,
+                   help="send zoomed detail crops to the critic (off by default). "
+                        "Config: critic.crops")
+    p.add_argument("--crop-pad", type=float, default=None,
+                   help="detail-crop padding fraction (default 0.12). Config: "
+                        "critic.crop_pad")
     # layout overrides (default: from RUN_DIR/layout.json)
     p.add_argument("--tracking", default="",
                    help="capture tracking dir override (cameras.npz + "
@@ -966,7 +1198,13 @@ def main():
 
     layout = resolve_layout(run_dir, args)
     check_inputs(layout)
+    args.selected_critic_frames = select_critic_frames(args, layout["frames"])
     log(f"frames: {', '.join(layout['frames'])}  (ref {layout['ref_frame']})")
+    if args.selected_critic_frames:
+        selected = [f for f in layout["frames"] if f in args.selected_critic_frames]
+        log("VLM screening: " + ", ".join(selected))
+    else:
+        log("VLM screening: none (numeric/visual iteration)")
     if not args.depth_report:
         log("depth reporting: OFF (depth_config.json report=false / "
             "--no-depth-report) — no depth score/residual panels; the depth view "

@@ -13,7 +13,7 @@ the page header, plus a manifest indexing every tile.
 
 THE TILES STAY ON DISK. A sheet answers "is this object coherent from every angle,
 in this configuration" at a glance; it is not a replacement for the individual
-renders, which is what you open
+renders, which is what `critic.py` feeds a VLM at full resolution and what you open
 when a suspect region needs pixels. Both media, same renders — the sheet is the
 index, not the archive.
 

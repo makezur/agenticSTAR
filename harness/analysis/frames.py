@@ -99,7 +99,7 @@ def order_frames(names, reverse=False):
 
 
 # --------------------------------------------------------------------------- #
-# window resolution — frame paths around an --anchor
+# window resolution — the critic's --frames window around an --anchor
 # --------------------------------------------------------------------------- #
 def _offsets_from(offsets, radius, step):
     """The list of frame-number offsets to apply around the anchor.
@@ -267,8 +267,8 @@ def _emit(paths, emit):
 def main():
     p = argparse.ArgumentParser(
         prog="frames",
-        description="order frame ids temporally, or resolve a frame window "
-                    "around an --anchor by offset")
+        description="order frame ids temporally, or resolve a critic --frames "
+                    "window around an --anchor by offset")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     po = sub.add_parser("order", help="print frame ids/paths in temporal order")

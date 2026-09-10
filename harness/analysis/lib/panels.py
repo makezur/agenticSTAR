@@ -8,10 +8,10 @@ drawing — no scoring, no I/O beyond writing the timeline PNG — so both `scor
 and `viz/` depend on it without a cycle.
 
 The overlap COLOURS live here, not in `viz.composite`, because every tool that
-paints or captions that panel must agree pixel-for-pixel: the composite strip
-and the candidate sheets the pool writes after each sweep. One definition,
-imported by all of them (`viz.composite` re-exports them). `viz.rows`
-builds the actual rows out of these primitives.
+paints or captions that panel must agree pixel-for-pixel: the composite strip,
+the candidate sheets the pool writes after each sweep, and the critic's prompt.
+One definition, imported by all of them (`viz.composite` re-exports the old
+names). `viz.rows` builds the actual rows out of these primitives.
 
 THE ALIGNMENT INVARIANT. A header bar is STACKED ABOVE its panel, not overlaid on
 it: `label` returns a taller image, and no render pixel is ever covered. Panels sit
@@ -152,9 +152,9 @@ def solid(height, width, bgr, channels=3):
 # calm blue — so "our volume is still there, just not scored" reads directly
 # instead of vanishing into the ignored gray.
 #
-# These live in `lib` because the composite strip and candidate sheets must
-# describe the SAME pixels. `viz.composite` re-exports them under their original
-# names.
+# These live in `lib` because the composite strip, the candidate sheets, and the
+# critic's prompt must all describe the SAME pixels. `viz.composite` re-exports
+# them under their original names.
 # ------------------------------------------------------------------------- #
 OVL_AGREE = (85, 140, 82)      # mask & render agree                muted green
 OVL_EXTRA = (0, 235, 255)      # render only: EXTRA volume, SCORED   hot yellow
@@ -163,7 +163,7 @@ OVL_WAIVED = (225, 150, 60)    # our render under the hand — WAIVED  blue
 OVL_HAND = (62, 62, 62)        # ignored hand, nothing of ours there dark gray
 
 # Caption fragments describing the coding above — ONE definition, so the panel
-# label and docs can't drift from the pixels.
+# label, the critic's prompt, and the docs can't drift from the pixels.
 #
 # "MAYBE OCCLUDED" rather than the longer "POSSIBLE HAND OCCLUSION": it says the
 # same thing (this volume may be hidden behind the hand, so it is not scored) in

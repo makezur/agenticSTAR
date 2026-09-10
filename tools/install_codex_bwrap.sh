@@ -33,6 +33,10 @@ Options:
   --install-dir DIR  Launcher destination (default: ~/.local/bin)
   --check            Validate prerequisites without installing anything
   -h, --help         Show this help
+
+Export OPENAI_API_KEY once before running this; Codex stores the login in the
+state directory. Export ANTHROPIC_API_KEY as well to let the VLM critic run on
+Claude inside Codex runs (harness/analysis/scorers/critic/critic.md).
 EOF
 }
 
@@ -266,6 +270,17 @@ elif ! grep -q '"OPENAI_API_KEY"' "$CODEX_STATE/auth.json" 2>/dev/null; then
 fi
 # The key is provisioning input, not runtime configuration.
 unset OPENAI_API_KEY
+
+# Optional: an Anthropic key for the harness's VLM critic (--critic-provider
+# anthropic). Stored beside auth.json; the launcher exports it into the sandbox
+# and allows api.anthropic.com only when this file exists.
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  umask 077
+  printf '%s\n' "$ANTHROPIC_API_KEY" > "$CODEX_STATE/anthropic_api_key"
+  umask 022
+  echo "Stored an Anthropic key for the VLM critic: $CODEX_STATE/anthropic_api_key"
+fi
+unset ANTHROPIC_API_KEY
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/codex-articulated"
 mkdir -p "$CONFIG_DIR"

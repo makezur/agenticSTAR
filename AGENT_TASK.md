@@ -122,8 +122,8 @@ before proceeding.
     [depth scoring](harness/analysis/scorers/depth.md). Depth supervision can be
     turned off independently of the cameras via `RUN_DIR/depth_config.json`
     (`report` for the scorer/panels, `cost` for the sweep penalty); with it off,
-    rely on the silhouette/turntable signals. Tracking-derived camera seeds
-    still apply.
+    rely on the silhouette/turntable/critic signals. Tracking-derived camera
+    seeds still apply.
 11. **Never step blind.** Every iteration, open at least one
     `side_by_side_<frame>.png` from the fresh pass dir and confirm the render reads
     as the **same object** (parts, proportions, landmarks, color) in the **same
@@ -148,7 +148,7 @@ bakes in an observed pose or joint state.
   (`python -m analysis.viz.depth_units --pass-dir
   RUN_DIR/iterations/NNNNNN/renders/NNNN`).
 - Render views and diagnostics: [harness/views/README.md](harness/views/README.md).
-- Metrics, visualization, aggregation, pose comparison, and geometry
+- Metrics, visualization, critic, aggregation, pose comparison, and geometry
   checks: [harness/analysis/README.md](harness/analysis/README.md).
 - Pose/joint search: [sweep](harness/views/sweeps/sweep.md).
 - Apply a direction order per frame and render + score just that one config (a single-candidate sweep): [apply](harness/views/sweeps/apply.md).
@@ -168,7 +168,7 @@ bakes in an observed pose or joint state.
 
 Every render call creates a fresh numbered, immutable pass directory and prints
 its path. Use that exact `PASS_DIR`; never substitute artifacts from an older
-pass.
+pass. A critic verdict is valid only for the screened pass and `scene.py` hash.
 
 ## The signals
 Do not average the signals; each owns a different question:
@@ -207,14 +207,20 @@ Do not average the signals; each owns a different question:
   Depth and IoU are blind to global, semantic errors.
   Do not judge only from numbers or the stacked composite.
 <!-- endif -->
-- **[`apply`](harness/views/sweeps/apply.md):** *checks* one named order — a tilt, turn,
-  orbit, or open. Composes it onto the frame's pose and scores that single
-  silhouette's IoU/depth/side-by-side against the mask. Use it to confirm a
-  directional read; use [`sweep`](harness/views/sweeps/sweep.md) to *find* the
-  magnitude across a range.
+- **Critic:** holistic and directional. A fresh selected-frame screen is
+  **required** to declare the coarse shape checkpoint (see step 4); elsewhere it
+  is optional — use it when signals conflict, attribution stalls, or symmetry
+  makes a wrong orientation plausible. Never paste its invented magnitude into a
+  pose; route its `shape`/`pose`/`joint` hypothesis and measure with a sweep.
+  - **[`apply`](harness/views/sweeps/apply.md):** *checks* one named order — a tilt, turn,
+    orbit, or open. Composes it onto the frame's pose and scores that single
+    silhouette's IoU/depth/side-by-side against the mask. Use it to confirm a
+    directional read; use [`sweep`](harness/views/sweeps/sweep.md) to *find* the
+    magnitude across a range.
 
 Side-by-side identity, IoU, and turntable coherence are hard visual gates. A
-passing IoU cannot clear a wrong shape or incoherent geometry.
+critic cannot override a failing hard gate; a passing IoU cannot clear a wrong
+shape, incoherent geometry, or an unreconciled high-severity critic finding.
 
 ## Iteration protocol
 
@@ -322,12 +328,16 @@ iterations yourself in paths or `NOTES.md`. See
    sweeps to be meaningful. The shape **MUST** be semantically/visually coherent
    and plausible. This is not final shape approval: fine contours, landmarks,
    materials, and geometric detail may remain approximate. Before declaring, you
-   **MUST** run `shape_pass.sh RUN_DIR --frames <all> --pass-label coarse-shape`
-   and read the selected diagnostic side-by-sides and every observed-state
-   turntable sheet. Declare only when those reads show the same coherent object
-   and the declared rig can express the observed articulation (pose and joint
-   states are refined after the checkpoint; a rig that cannot produce the visible
-   motion blocks it — pose refinement is not meaningful until it can). Record
+   **MUST** run a fresh critic screen on the selected diagnostic frames
+   (`shape_pass.sh RUN_DIR --frames <all> --critic-frames <selected>
+   --pass-label coarse-shape`)
+   and declare only when no high-severity `shape` finding is unreconciled and the
+   critic reads the render as the same, coherent object. The identity/realism
+   *scores* and any `pose`/`joint_state` findings do not block here (pose and
+   joint states are refined after the checkpoint). A high `joint_definition`
+   finding does block: pose refinement is not meaningful until the rig can
+   express the observed articulation. With no usable credentials the critic skips, so
+   note that in `NOTES.md` and proceed on your own read. Record
    `coarse shape checkpoint: passed` and the visual rationale in
    `RUN_DIR/NOTES.md`; `--pass-label coarse-shape` and bookkeeping identify
    the supporting iteration automatically.
@@ -361,6 +371,12 @@ iterations yourself in paths or `NOTES.md`. See
    ```bash
    harness/utils/shape_pass.sh RUN_DIR --frames <all frames>
    ```
+   Motion-only routine passes make no VLM calls. Run a selected-frame critic
+   screen on the coarse shape checkpoint pass (required, see step 4) **and** on
+   any shape round or whenever a shape defect or shape regression is suspected —
+   the critic is the strongest shape signal and must not go dark for the middle
+   of the run. Use selected critic coverage only when warranted; use all-frame
+   critic coverage only for a small run or deliberate checkpoint.
 8. **Eyes before numbers.** Review this pass's **review set**: the selected
    diagnostic views plus the worst **K** frames by gate field (`iou_raw`, or
    `iou_visible` with a hand mask). Choose K freely, but NEVER below 3. For each,
@@ -382,7 +398,7 @@ iterations yourself in paths or `NOTES.md`. See
    landmarks, articulation, or identity become visibly worse, reject the round
    and restore the last accepted values. **Never accept a shape change on IoU
    grounds** — IoU is shape-blind, so a geometry edit is judged only on the
-   side-by-side and turntable read. Reject a shape change that produces
+   side-by-side, turntable, and critic read. Reject a shape change that produces
    implausible or over-corrected geometry (thinned-to-wire, blobby, or otherwise
    out-of-distribution parts) even when IoU rises; a coherent, real-looking object
    outranks a higher overlap on distorted geometry.
@@ -440,17 +456,18 @@ IoU says how far off a frame is, not why:
 
 - **Shape (`build()`):** major landmarks cannot align simultaneously; local
   contours or proportions are wrong; a part is missing, extra, detached,
-  under-modelled, or incoherent on the turntable. A mismatch need not look
-  identical from every view to be geometric.
+  under-modelled, or incoherent on the turntable; or a critic reports a `shape`
+  finding. A mismatch need not look identical from every view to be geometric.
   Fix coarse geometry before motion refinement, apart from the documented
   initialization and early-correction exceptions above.
 - **Pose (`FRAMES[name]["pose"]`):** the whole rigid object shows a common
   displacement at two or more separated landmarks while its internal
-  proportions read correctly, or genuine base motion occurred. Set `moved` only
-  for genuine object motion.
+  proportions read correctly, genuine base motion occurred, or the critic
+  identifies a pose/symmetry error. Set `moved` only for genuine object motion.
 - **Joint state (`FRAMES[name]["joints"]`):** the parent remains aligned while two or
   more landmarks on one moving subassembly share a coherent rigid displacement,
-  and an existing declared joint can produce that displacement.
+  and an existing declared joint can produce that displacement, or critic
+  evidence identifies a `joint_state` error.
 - **Joint definition (`JOINTS`):** the source shows relative motion that no
   declared joint can produce, or the responsible joint has the wrong
   type/axis/origin/parent/children/limit. This is shared model structure and
@@ -461,8 +478,8 @@ IoU says how far off a frame is, not why:
   page** (see Signals).
 <!-- endif -->
 
-Use depth direction, aspect-ratio mismatch, cross-frame IoU spread, and
-turntables to corroborate attribution. A sweep changes only pose and joints,
+Use depth direction, aspect-ratio mismatch, cross-frame IoU spread, turntables,
+and critic tags to corroborate attribution. A sweep changes only pose and joints,
 never geometry. Except for the single coarse initialization and a documented
 early correction, do not sweep before the coarse shape checkpoint. Visual
 inspection chooses the sweep DOFs and ranges; the search scores candidates
@@ -479,7 +496,9 @@ Checklist:
 - **Coarse shape checkpoint:** the accepted iteration carries the
   `coarse-shape` label; `NOTES.md` records why major parts and overall
   proportions were sufficient for
-  reliable motion refinement.
+  reliable motion refinement. The recorded pass is backed by a fresh
+  selected-frame critic screen with high-severity `shape`/semantic-identity
+  findings reconciled or justified.
 - **Final shape refinement:** after pose and joint alignment, all-frame
   side-by-sides match major parts, proportions, landmarks, distinctive contours,
   materials, and assembly structure, with no unresolved cross-frame shape
@@ -515,14 +534,26 @@ Checklist:
   (`PASS_DIR/self_intersection.txt`) has been read: every marked overlap is
   explained (a modelled contact) or fixed; non-watertight exclusions acknowledged
   as unchecked.
-- **Rig review (required before pose windows):** the declared rig can express
-  every relative motion visible in the source. If it cannot, fix JOINTS and
-  rerender before refining states.
+- **Fresh critic coverage:** when credentials are available, screen a current
+  coverage set (normally 4-8 frames) containing the reference, distinct joint
+  extremes, worst metric/depth disagreements, and explicit suspects.
+- **Critic review (required):** every fresh high-severity `shape`, `pose`,
+  `joint_state`, or `joint_definition` item in `critic_review_required` is fixed
+  or explicitly justified in
+  `NOTES.md`. Stale verdicts never enter this gate; medium/low findings remain
+  advisory.
+- **Rig review (required before pose windows):** `rig_review_required` is empty.
+  A high `joint_definition` finding means the declared rig cannot express the
+  observed relative motion; fix JOINTS and rerender before refining states.
 <!-- if module:mechanism -->
 - **Mechanism pick (hard gate, articulated runs):** every blind A/B joint choice
   is fresh, resolved, and consistent with the declaration;
   `python -m analysis.mechanism_calls check --run-dir RUN_DIR` exits 0.
 <!-- endif -->
+- **Cross-frame shape review (advisory):** inspect `shape_consensus`; resolve or
+  justify repeated shape complaints. See
+  [aggregate](harness/analysis/rollup/aggregate.md).
+
 
 ## Finalization lock (non-negotiable)
 
@@ -530,18 +561,21 @@ Do not begin a release/finalization pass merely because progress is poor, time i
 limited, a coarse-shape checkpoint passed, or shortcomings can be reported
 honestly. A release pass is forbidden until a fresh routine pass proves ALL of
 <!-- if module:mechanism -->
-the stopping criteria above — including the two hard gates:
+the stopping criteria above — including the four hard gates: empty
+`critic_review_required`, empty `rig_review_required`,
 `multiagent.windows adjudicate --check` exiting 0, AND (on an articulated run)
 `analysis.mechanism_calls check` exiting 0.
 <!-- else -->
-the stopping criteria above — including the hard gate:
+the stopping criteria above — including the three hard gates: empty
+`critic_review_required`, empty `rig_review_required`, AND
 `multiagent.windows adjudicate --check` exiting 0.
 <!-- endif -->
 
 1. Run the release pass and capture its fresh numeric `PASS_DIR`:
    ```bash
-   harness/utils/shape_pass.sh RUN_DIR --frames <all>
+   harness/utils/shape_pass.sh RUN_DIR --frames <all> --critic-frames <coverage>
    ```
+   Use `--critic-all` only for a small run or deliberate diagnosis.
 2. Read every final side-by-side, composite, and every turntable sheet — one page
    per articulation state, every angle of that state on it
    (`turntable_sheets/turntable_sheet_<state>.png`). Selected shape views do not
@@ -575,10 +609,12 @@ the stopping criteria above — including the hard gate:
    - watertight result per part;
    - explicit all-state coherence confirmation;
    - aggregate moved-flag results;
-   - every joint-definition change and what in the source motivated it;
+   - every `critic_review_required` item and its resolution;
+   - every `rig_review_required` item and the resulting joint-definition change;
    - every seam verdict from `seam_calls.json` — the step, the verdict, and the
      evidence — and for any `flip`, how it was cleared (which segment was
      un-flipped, and what confirmed the correction by eye);
+   - `shape_consensus` findings and resolution of repeated complaints; and
    - an honest per-frame quality assessment and remaining discrepancies.
 
 If time or iterations end with a poor match, failed watertightness, or an

@@ -5,11 +5,10 @@ One owner for two things:
   * JSON I/O: `read_json` (None if absent) and `write_json` (makedirs +
     indent=2).
   * the per-frame filename convention: a frame like `000040.jpg` has stem
-    `000040` and its scores live in `metrics_000040.json` and
-    `depth_000040.json`. Both the writer (shape_pass.py, via the tools) and the
-    reader (aggregate.py)
-    go through these builders so the convention is defined ONCE, not re-derived
-    on each side.
+    `000040` and its scores live in `metrics_000040.json` / `depth_000040.json` /
+    `critic_000040.json`. Both the writer (shape_pass.py, via the tools) and the
+    reader (aggregate.py) go through these builders so the convention is defined
+    ONCE, not re-derived on each side.
 """
 
 import json
@@ -27,6 +26,10 @@ def metrics_json(stem):
 
 def depth_json(stem):
     return f"depth_{stem}.json"
+
+
+def critic_json(stem):
+    return f"critic_{stem}.json"
 
 
 def read_json(path):

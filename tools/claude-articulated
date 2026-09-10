@@ -187,6 +187,14 @@ CLAUDE_MODEL="${ARTSCRIPT_CLAUDE_MODEL:-$(claude_settings_get "$CLAUDE_SETTINGS"
   die "$HOST_CLAUDE_HOME/$CLAUDE_API_KEY_FILE is missing.
 Export ANTHROPIC_API_KEY and rerun tools/install_claude_bwrap.sh once to provision it."
 CLAUDE_API_KEY="$(head -n1 "$HOST_CLAUDE_HOME/$CLAUDE_API_KEY_FILE")"
+# Optional second key for the harness's VLM critic (harness/analysis/scorers/critic)
+# when it runs on OpenAI: tools/install_claude_bwrap.sh stores $OPENAI_API_KEY here
+# when it is exported at setup. Present -> exported into the sandbox and
+# api.openai.com joins the egress allowlist; absent -> nothing changes.
+CRITIC_OPENAI_KEY=""
+if [[ -s "$HOST_CLAUDE_HOME/openai_api_key" ]]; then
+  CRITIC_OPENAI_KEY="$(head -n1 "$HOST_CLAUDE_HOME/openai_api_key")"
+fi
 
 SANDBOX_PROJECT="/home/ubuntu/articulated_script"
 SANDBOX_BLENDER="/home/ubuntu/blender"
@@ -265,6 +273,7 @@ if [[ "$SANDBOX_NET" == allowlist ]]; then
     mapfile -t egress_hosts < <(
       claude_provider_egress_hosts "$CLAUDE_PROVIDER"
     )
+    [[ -z "$CRITIC_OPENAI_KEY" ]] || egress_hosts+=("api.openai.com:443")
   else
     read -r -a egress_hosts <<< "$SANDBOX_EGRESS_HOSTS"
   fi
@@ -766,6 +775,8 @@ bwrap_args+=(
 )
 bwrap_args+=(--setenv ARTSCRIPT_CLAUDE_PROVIDER "$CLAUDE_PROVIDER")
 bwrap_args+=(--setenv ANTHROPIC_API_KEY "$CLAUDE_API_KEY")
+[[ -z "$CRITIC_OPENAI_KEY" ]] ||
+  bwrap_args+=(--setenv OPENAI_API_KEY "$CRITIC_OPENAI_KEY")
 
 if [[ "${1:-}" == "--check-isolation" ]]; then
   "${netns_prefix[@]}" "${proc_prefix[@]}" bwrap "${bwrap_args[@]}" /bin/bash -ceuo pipefail '

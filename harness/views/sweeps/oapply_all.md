@@ -63,7 +63,7 @@ harness/render.sh RUN_DIR/scene.py RUN_DIR/views --views oapply_all \
     --masks-dir MASKS_DIR --hand-masks-dir HAND_MASKS_DIR --tracking CAPTURE/tracking \
     --oapply flips
 
-# a visually directed nod + front-axis roll on the canonical object:
+# a critic-directed nod + front-axis roll on the canonical object:
 harness/render.sh RUN_DIR/scene.py RUN_DIR/views --views oapply_all \
     --frames <all> --match-res IMAGE --masks-dir MASKS_DIR \
     --oapply 'rx:17;ry:-9'

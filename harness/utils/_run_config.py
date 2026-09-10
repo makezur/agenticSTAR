@@ -1,9 +1,9 @@
 """_run_config.py — resolve a run's per-run tool settings from a config json.
 
-`RUN_DIR/run_config.json` carries the concurrency knobs (G/N), render-pool
-settings, and visual presentation settings, so none of them need re-typing on
-every invocation. Both GPU-pool drivers read it — `utils/shape_pass.py` and
-`multiagent/pool_session.py` — which is why the FILE is named for the run rather
+`RUN_DIR/run_config.json` carries the concurrency knobs (G/N/C), render-pool
+settings, visual presentation settings, and the VLM-critic backend settings, so
+none of them need re-typing on every invocation. Both GPU-pool drivers read it —
+`utils/shape_pass.py` and `multiagent/pool_session.py` — which is why the FILE is named for the run rather
 than for either tool: the `pool` block is not the shape pass's property. It
 mirrors the `depth_config.json` precedent (a per-run json a tool reads instead of
 pure CLI flags), with the same precedence rule:
@@ -18,8 +18,11 @@ Schema (all fields optional; an absent/corrupt file -> {} -> pure CLI defaults, 
 older runs are unchanged):
 
     {
-      "concurrency": { "workers": 3, "ncpu": 4 },
+      "concurrency": { "workers": 3, "ncpu": 4, "critic_conc": 8 },
       "visuals": { "bg_mode": "black" },
+      "critic": { "provider": "auto", "model": "", "api_key_env": "",
+                  "max_tokens": 6000, "pass_realism": 0.7, "pass_identity": 0.7,
+                  "max_turntable": 16, "crops": false, "crop_pad": 0.12 },
       "pool": { "enable": false, "gpus": [0],
                 "archive_spool": true, "keep_spools": 8,
                 "candidate_sheet_max_dimension": 0,
@@ -58,7 +61,7 @@ def load_config(run_dir):
 
 
 def section(cfg, name):
-    """A named top-level block ('concurrency' | 'visuals' | 'pool') as a dict —
+    """A named top-level block ('concurrency' | 'visuals' | 'critic' | 'pool') as a dict —
     {} when absent or the wrong type."""
     s = cfg.get(name)
     return s if isinstance(s, dict) else {}
@@ -109,16 +112,20 @@ def side_by_side_max_dimension(cfg):
 # --------------------------------------------------------------------------- #
 # The scaffold is a deliberate full-size profile, not the built-in defaults
 # above: pool on, 16 workers/ncpu (the per-GPU cap,
-# pool.manager.MAX_WORKERS_PER_GPU), alpha-backed visual panels. The built-in
-# defaults stay conservative so a bare run with NO config file doesn't try to
-# spawn a 16-worker pool. The profile lives HERE, beside the schema and the
+# pool.manager.MAX_WORKERS_PER_GPU), alpha-backed visual panels, one critic
+# worker. The built-in defaults stay conservative so a bare run with NO config
+# file doesn't try to spawn a 16-worker pool. The profile lives HERE, beside the schema and the
 # defaults, so the two cannot drift apart.
 def scaffold_config(workers=16, ncpu=16, gpus=(0,),
                     candidate_sheet_max_dimension=0,
-                    side_by_side_max_dimension=0, keep_spools=8):
+                    side_by_side_max_dimension=0, keep_spools=8,
+                    critic_provider="auto"):
     return {
-        "concurrency": {"workers": int(workers), "ncpu": int(ncpu)},
+        "concurrency": {"workers": int(workers), "ncpu": int(ncpu),
+                        "critic_conc": 1},
         "visuals": {"bg_mode": "alpha"},
+        "critic": {"provider": critic_provider, "pass_realism": 0.7,
+                   "pass_identity": 0.7, "max_turntable": 16},
         "pool": {"enable": True, "gpus": [int(g) for g in gpus],
                  "archive_spool": True,
                  "keep_spools": int(keep_spools),
@@ -154,6 +161,10 @@ def _main(argv=None):
     p.add_argument(
         "--keep-spools", type=int, default=8,
         help="number of spool archives to retain (default 8; 0 = never prune)")
+    p.add_argument(
+        "--critic-provider", default="auto", choices=["auto", "anthropic", "openai"],
+        help="VLM backend for the critic block (default auto: whichever API key "
+             "the sandbox has)")
     a = p.parse_args(argv)
     out = os.path.join(a.run_dir, CONFIG_NAME)
     if os.path.isfile(out):
@@ -175,14 +186,15 @@ def _main(argv=None):
         a.workers, a.ncpu, gpus or (0,),
         candidate_sheet_max_dimension=a.candidate_sheet_max_dimension,
         side_by_side_max_dimension=a.side_by_side_max_dimension,
-        keep_spools=a.keep_spools)
+        keep_spools=a.keep_spools, critic_provider=a.critic_provider)
     with open(out, "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
     print(f"run config: wrote {out} (workers={a.workers}, ncpu={a.ncpu}, "
           f"pool.gpus={cfg['pool']['gpus']}, "
-          f"pool.keep_spools={cfg['pool']['keep_spools']}; edit to pin "
-          "non-default G/N or visual settings)")
+          f"pool.keep_spools={cfg['pool']['keep_spools']}, "
+          f"critic.provider={cfg['critic']['provider']}; edit to pin "
+          "non-default G/N/C, visual or critic settings)")
     return 0
 
 

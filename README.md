@@ -23,7 +23,8 @@ is [AGENT_TASK.md](AGENT_TASK.md); the `scene.py` contract is in
 The repo was designed and tested with GPT-5.6-Sol and Claude Fable 5. The
 results in the paper were obtained with the mechanism module turned on
 (`--enable mechanism`; it is off by default). Newer models tend to do better
-with it off.
+with it off. The GPT-5.6-Sol results were obtained with the `critic` branch,
+which adds a second VLM as a critic; newer models should work fine without it.
 
 ## Installation
 
@@ -62,6 +63,24 @@ The agent runs inside a Bubblewrap sandbox with network access limited to the
 model provider's API host. `SANDBOX_NET=open` disables that for debugging.
 `./run.sh --help` lists the remaining options (GPU pinning, frame selection,
 resume, `--prompt-only`).
+
+## Critic
+
+This branch adds `harness/analysis/scorers/critic`, a second VLM that judges a
+pass's renders against the photos (realism, identity, and tagged shape, pose and
+joint fixes). The agent invokes it through `shape_pass.sh --critic-frames ...` at
+the coarse-shape checkpoint and before finalizing, and `aggregate.py` gates
+high-severity findings. See [critic.md](harness/analysis/scorers/critic/critic.md).
+
+It runs inside the sandbox and needs an API key there:
+
+- `--critic-provider openai` (`gpt-5.6-sol`): Codex runs use the Codex login,
+  nothing to set up.
+- `--critic-provider anthropic` (`claude-opus-5`): Claude runs already have the
+  key. For Codex runs export `ANTHROPIC_API_KEY` as well when running
+  `tools/install_codex_bwrap.sh`; the launcher then passes it into the sandbox
+  and allows `api.anthropic.com`. The paper's GPT-5.6-Sol runs used this setup.
+- the default `auto` takes whichever key is present, Anthropic first.
 
 ## Input format
 

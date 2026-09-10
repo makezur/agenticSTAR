@@ -15,8 +15,8 @@ inside the object, weighted by the per-pixel confidence.
   no reason to skip it on any pass.
 - It is a **strong-but-noisy guide, not a gate.** A large `depth_mae_canon`
   is a prompt to check the **pose** (usually translation-Z)
-  **before** iterating on shape, but it is weighed against IoU and the source
-  images (observed depth is noisy) and does **not** by itself block finalize.
+  **before** iterating on shape, but it is weighed against IoU and the VLM critic
+  (observed depth is noisy) and does **not** by itself block finalize.
 
 ## Frames & scale (important)
 - The harness **camera 0** (identity extrinsic, OpenCV convention) IS the frame
@@ -99,7 +99,7 @@ Scaffold them off with `run.sh --no-depth-report` / `--no-depth-render` /
   metric prior: `0.23` means "off by a quarter of the object" whether it's a
   microwave or a pair of scissors. **A large value on any frame is a strong-but-noisy
   guide that the pose (usually translation-Z) may be off — investigate before
-  iterating on shape, but weigh it against IoU and the source images, since observed depth
+  iterating on shape, but weigh it against IoU and the critic, since observed depth
   is noisy. It is a guide, not a gate.**
 - **`depth_bias` / `depth_bias_canon`** — the **signed** mean residual (`render −
   observed`), in observed units / canonical units. `depth_mae` says *how far off*;
@@ -114,7 +114,7 @@ Scaffold them off with `run.sh --no-depth-report` / `--no-depth-render` /
   pose is right, so a pose error masquerades as "scale" and the fitted residual
   explains it away.
   The guide signal is the RAW `depth_mae` / `depth_mae_canon` (strong but noisy —
-  weigh it against IoU and the source images, don't gate on it); `depth_bias` carries
+  weigh it against IoU and the critic, don't gate on it); `depth_bias` carries
   the direction.
 - **`point_l2_mae` / `point_l2_rmse`** — secondary: full **XYZ** pointmap error
   (unproject the rendered depth through Pi3X K, compare 3-D points). Catches

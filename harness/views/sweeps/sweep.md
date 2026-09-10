@@ -55,8 +55,8 @@ there is no scale DOF, because `SCALE` is global (one number for the built objec
 so a per-frame verb must not search it; to resize, edit `SCALE` in `scene.py`. It
 **cannot fix shape** — it only re-poses/articulates finished
 geometry. If the **turntable** shows a wrong/detached/under-modelled/misproportioned
-part, edit `build()` FIRST: sweeping against wrong geometry just finds the pose
-that best paints the wrong
+part, or the **VLM critic** flags a `shape` fix (any severity), edit `build()`
+FIRST: sweeping against wrong geometry just finds the pose that best paints the wrong
 silhouette and entrenches the error under a deceptively high IoU.
 
 ## Search methods and basins
@@ -208,8 +208,8 @@ on purpose: a fitted scale assumes the pose is right, so a pose error
 masquerades as "scale". A candidate with no scorable depth pixels takes the full
 penalty. The legend prints a blunt **`depth loss: HIGH/LOW/UNSCORED`** verdict for
 the winner (HIGH = error > 0.10 of the object's size → a strong-but-noisy hint that
-the pose/translation-Z, or a joint state, is off — confirm against the photo and
-IoU; observed depth is a guide, not a gate).
+the pose/translation-Z, or a joint state, is off — confirm against the photo / IoU
+/ critic; observed depth is a guide, not a gate).
 
 **Turning depth supervision off.** The per-run `RUN_DIR/depth_config.json` flip
 switch `"cost": false` forces `depth_weight 0` here (pure-IoU ranking), regardless
@@ -274,7 +274,7 @@ harness/render.sh RUN_DIR/scene.py RUN_DIR/views --views sweep \
     --sweep-mask MASK \
     --sweep-ranges 'yaw:-17,17;door_hinge:-80,12'
 
-# DIRECTION + SEARCH in one call: apply a visually estimated ~90° turn, then run local DE
+# DIRECTION + SEARCH in one call: apply the critic's ~90° turn, then run local DE
 # (--sweep-start-shift carries joints too, unlike --sweep-pose-start):
 harness/render.sh RUN_DIR/scene.py RUN_DIR/views --views sweep \
     --match-res IMAGE --sweep-mask MASK \
@@ -505,12 +505,12 @@ legible directly. Then `--sweep-pose-start` that winning pose and refine.
 
 Use `sweep` when a configuration is roughly right but the gate IoU is stuck below
 target and you'd otherwise hand-tune the numbers. It only re-poses / articulates the
-finished object — so if the **turntable** or side-by-side says a part is wrong,
+finished object — so if the **turntable** or the **critic** says a part is wrong,
 missing, under-modelled, or misproportioned, that's a **shape** error; fix `build()`
 first (no pose, however swept, can fix geometry).
 
-1. **Read** the frame's current `pose`/`joints`, last `iou_raw`, side-by-side,
-   and turntable. Fix visible shape errors in `build()` before sweeping.
+1. **Read** the frame's current `pose`/`joints` and the last `iou_raw` (and the
+   critic's tagged fixes — if any are `shape`, fix `build()` before sweeping).
 2. **Pick the space + DOFs.** Name the pose orders and/or joints you want to move.
    If the pose↔joint are coupled on a moved frame, name both — a grid over the two
    maps the valley (order a dense 2-DOF grid to SEE it).

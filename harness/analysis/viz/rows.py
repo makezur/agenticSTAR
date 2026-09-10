@@ -23,8 +23,8 @@ absent depth map.
 
 Inputs arrive as ARRAYS, not paths (`RowInputs`), because the callers differ in
 where pixels come from: the candidate sheet caches one decoded source per frame
-across many rows, while composite loads from disk. `from_paths` covers the
-load-from-disk case.
+across many rows, the critic already holds arrays it fetched for the VLM, and
+composite loads from disk. `from_paths` covers the load-from-disk case.
 """
 
 import numpy as np

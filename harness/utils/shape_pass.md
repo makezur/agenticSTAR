@@ -4,7 +4,7 @@ This is the main beat of the **shape loop**: author `RUN_DIR/scene.py`, render +
 score every frame, look at the images, repeat. It produces the full diagnostic
 set. After a pose-windows apply, use `composite_pass.sh` for the routine match
 renders and composites; use this full pass only when its additional shape,
-depth, mechanism, aggregate, or self-intersection outputs are needed.
+depth, mechanism, critic, aggregate, or self-intersection outputs are needed.
 
 A pass is a fixed sequence that is otherwise run by hand: `render.sh`
 (`match,turntable,depth`) → then, **per frame**, a `composite.py` call that threads
@@ -30,6 +30,8 @@ removes the boilerplate of producing them.
 harness/utils/shape_pass.sh RUN_DIR --frames 000000.jpg,000040.jpg
 harness/utils/shape_pass.sh RUN_DIR                     # frames from layout.json
 harness/utils/shape_pass.sh RUN_DIR --pass-label coarse-shape
+harness/utils/shape_pass.sh RUN_DIR --critic-frames 000000.jpg,000040.jpg
+harness/utils/shape_pass.sh RUN_DIR --critic-all         # deliberate all-frame screen
 harness/utils/shape_pass.sh RUN_DIR --pool --workers 3  # render via the resident pool
 ```
 
@@ -50,8 +52,12 @@ through the caller's terminal. `shape_pass.sh` prints the log path and final
 |---|---|
 | `--frames a.jpg,b.jpg` | frames to render + score (default: the `frames` in `layout.json`) |
 | `--existing-pass DIR` | recover an open iteration by scoring an existing pass under its `renders/` directory, without rerendering |
-| `--bg-mode alpha\|black` | backdrop for the composite panels (default `black`; the scaffolded config pins `alpha`). Config: `visuals.bg_mode` |
+| `--critic-frames a.jpg,b.jpg` | VLM-screen only this coverage/suspect set; default is no VLM calls |
+| `--critic-all` (`--critic`) | VLM-screen every rendered frame at a deliberate checkpoint |
+| `--critic-ground` | feed the critic numeric grounding (metrics/depth) per frame; off by default — it stays an independent image-only judge unless you opt in (see [critic.md](../analysis/scorers/critic/critic.md)) |
+| `--bg-mode alpha\|black` | backdrop for the composite panels and the critic's images (default `black`; the scaffolded config pins `alpha`). Config: `visuals.bg_mode` |
 | `--pool-timeout S` | per-order wait timeout for a pool render (default 600) |
+| `--no-critic` | compatibility spelling for the no-VLM default; conflicts with either positive critic mode |
 | `--engine CYCLES` | render engine (default `BLENDER_EEVEE_NEXT`; use `CYCLES` for a final pass) |
 | `--samples N` | render samples (default 64) |
 | `--turntable-views ring4\|sphere8` | turntable view set per articulation state: `sphere8` (default — a level ring plus a raised and a dropped pair, so a caved-in top or unbuilt base is visible) or `ring4` (the level ring only, half the renders per state). Turntable cost is **states × views**. See [../views/turntable.md](../views/turntable.md) |
@@ -61,17 +67,24 @@ through the caller's terminal. `shape_pass.sh` prints the log path and final
 | `--depth-report` / `--no-depth-report` | score + panel Pi3X depth this pass (`depth_<stem>.json`, the depth-residual images, the `depth_mae_canon` summary column). `--no-depth-report` skips depth **scoring only**; every downstream depth reporter then goes quiet on its own, but the depth view is still rendered (see `--no-depth-render`). Camera seeds / `measure_depth` are unaffected. Default on. Config: `depth_config.json` `report` |
 | `--depth-render` / `--no-depth-render` | render the depth view this pass (`depth_<stem>.npy`), which feeds the depth scorer **and** the GT-free object-units `DEPTH` panel / [depth sheet](../analysis/viz/depth_units.md). `--no-depth-render` drops the view — one render per frame per pass cheaper, and every depth visual then has nothing to draw. Independent of `--depth-report`; this is the switch for a run that should not pay for depth at all. Default on. Config: `depth_config.json` `render` |
 | `--ncpu N` | **N** — CPU scoring workers, concurrent `composite`+`depth` subprocesses (default `min(4, cpu_count)`; `1` = serial). Config: `concurrency.ncpu` |
+| `--critic-conc C` | **C** — VLM critic workers, concurrent `critic.py` subprocesses (network-bound; default `8`; `1` = serial). Config: `concurrency.critic_conc` |
 | `--pool` / `--no-pool` | render per-frame `match`/`depth` through the resident **render pool** instead of a cold `render.sh` (see below). Default off. Config: `pool.enable` |
 | `--workers G` | **G** — resident Blender workers when `--pool` (default `2`). Config: `concurrency.workers` |
 | `--gpus 0,1` | GPU ids the pool pins workers to, round-robin (default: none — Blender sees all). Config: `pool.gpus` |
+| `--provider / --model / --api-key-env` | VLM critic backend (default `auto` / per-provider model / per-provider key variable). Config: the `critic` block |
+| `--max-tokens / --pass-realism / --pass-identity / --max-turntable / --crops / --crop-pad` | critic knobs forwarded to `critic.py` (see [critic.md](../analysis/scorers/critic/critic.md)). Config: the `critic` block |
 
-All frames are scored numerically in parallel with `--ncpu` CPU workers. This
-changes wall-clock only; subprocess outputs are byte-identical to serial scoring.
-A hard failure in any CPU scorer aborts the whole pass.
+All frames are scored numerically in parallel with `--ncpu` CPU workers. When a
+screen is requested, only the selected frames feed `--critic-conc` network workers.
+This changes wall-clock only; subprocess outputs are byte-identical to serial
+scoring. Parallel VLM calls reduce latency, not token/image cost, which is why the
+routine default screens none. A hard failure in any CPU scorer still aborts the
+whole pass; the selected critic calls stay soft.
 
 ## Config — `RUN_DIR/run_config.json` (optional)
 
-The concurrency knobs **G / N** and the visual presentation settings can live in a
+The concurrency knobs **G / N / C**, the visual presentation settings and the
+VLM-critic backend settings can live in a
 per-run `run_config.json` beside `layout.json` / `depth_config.json`, so they need
 not be re-typed on every call. Precedence is the same as `depth_config.json`:
 **explicit CLI flag > `run_config.json` > built-in default**. Every field is
@@ -81,20 +94,29 @@ are unchanged. The legacy `iterate_config.json` is still read when no
 `run.sh` scaffolds one for every new multi-frame run (via
 `python -m utils._run_config`, whose `scaffold_config` is the full-size
 profile: pool on, 16 workers/ncpu per GPU (`MAX_WORKERS_PER_GPU`),
-`bg_mode` "alpha"; `--workers/--ncpu/--gpus` on run.sh
+`critic_conc` 1 and `bg_mode` "alpha"; `--workers/--ncpu/--gpus` on run.sh
 override the sizes). A re-run never clobbers an existing file. Delete it to
 fall back to pure CLI defaults, or edit it to pin different values for the run.
 Full schema (values shown are the built-in CLI defaults, NOT the scaffold's):
 
 ```json
 {
-  "concurrency": { "workers": 3, "ncpu": 4 },
+  "concurrency": { "workers": 3, "ncpu": 4, "critic_conc": 8 },
   "visuals": { "bg_mode": "black" },
+  "critic": { "provider": "auto", "model": "", "api_key_env": "",
+              "max_tokens": 6000, "pass_realism": 0.7, "pass_identity": 0.7,
+              "max_turntable": 16, "crops": false, "crop_pad": 0.12 },
   "pool":  { "enable": false, "gpus": [0],
              "candidate_sheet_max_dimension": 0,
              "side_by_side_max_dimension": 0 }
 }
 ```
+
+An empty `critic.model` (or an omitted field) means "use `critic.py`'s own default"
+(`auto` → the first provider with a usable key; `anthropic` → `claude-opus-5`,
+`openai` → `gpt-5.6-sol`) whenever an explicit screen is requested. Backend
+configuration does not enable screening by itself; `run.sh --critic-provider`
+pins the provider.
 
 `pool.candidate_sheet_max_dimension` and `pool.side_by_side_max_dimension`
 control derived preview pages and strips. `0` selects the native image directly.
@@ -126,7 +148,7 @@ pointmap directly and always work:
 - **`report`** — the depth **scorer / panels** (`depth_<stem>.json`, the
   depth-residual images). `false` makes
   `shape_pass` skip depth **scoring**; every downstream reporter (summary,
-  `aggregate`) reads those files, so it goes quiet on depth
+  `aggregate`, critic grounding) reads those files, so it goes quiet on depth
   automatically. It does **not** stop the depth render — see `render`.
   `shape_pass`'s `--depth-report`/`--no-depth-report` overrides this per pass.
 - **`render`** — the depth **view** itself (`depth_<stem>.npy`). Independent of
@@ -166,7 +188,7 @@ never the shared `pose.json`/GLB, `--pool` runs a **hybrid**:
    the old spool is **archived, not deleted** — see below.
 3. **Reconcile** — each order's `match_<stem>.png` / `depth_<stem>.npy` is copied into the
    gauge pass dir, so the pass dir ends up **identical** to the cold path and every
-   downstream step (scoring, `read_scale`, the summary) is unchanged.
+   downstream step (scoring, critic, `read_scale`, the summary) is unchanged.
 
 The pool changes only wall-clock, never pixels — a pooled `match_<stem>.png` /
 `depth_<stem>.npy` is byte-equivalent to the cold render. Any failed order aborts the
@@ -240,8 +262,10 @@ Each pass also contains its authoritative `pose.json`, `MANIFEST.json`, and
 `depth_<stem>.npy`, `depth_<stem>.json`, `depth_residual_<stem>.png`,
 `composite_<stem>.png`, and `side_by_side_<stem>.png` for every frame. The focused
 side-by-side image contains labeled source, masked source, and match panels; the
-masked source and match use the configured `visuals.bg_mode` backdrop. After
-completion, bookkeeping publishes
+masked source and match use the configured `visuals.bg_mode` backdrop.
+`critic_<stem>.json` exists only for explicitly selected frames (and only when
+credentials are usable); the pass stamps it with the render pass and `scene_sha1`.
+After completion, bookkeeping publishes
 the per-frame composites as
 `RUN_DIR/iterations/<iteration>/composites/<stem>.png`; open or failed
 iterations retain their pass-local outputs but do not receive this promoted
@@ -307,6 +331,11 @@ inventing one would defeat the point of making it.
 
 The closing summary prints each frame's `iou_raw` / `iou_visible` /
 `depth_mae_canon` read back from the JSON, so you see the gates without opening files.
+When screening is requested, it then prints the selected frames' realism / identity
+scores and every discrepancy in biggest-first order. **HIGH** fixes are marked and
+must be reconciled before finalize; med/low findings remain advisory. Only critic
+files from the current pass enter the report or gate. Older results are reported as
+`stale` historical context, while a missing/error/no-creds screen stays soft.
 
 ## Self-intersection (every pass, mandatory)
 
@@ -331,15 +360,16 @@ Then **read the individual images** (`side_by_side_`, `overlap_`,
 `depth_residual_`) plus **one turntable sheet per articulation state**
 (`turntable_sheets/turntable_sheet_<state>.png` — every orbit view of that state on
 one page, each tile labelled with the direction it was shot from) as the iteration
-protocol requires. `shape_pass.sh` produces the images and surfaces the numbers;
-it does not replace looking at them.
+protocol requires. `shape_pass.sh` produces the images and surfaces the numbers plus
+any selected screen; it does not replace looking at them.
 
 ## Running the sequence by hand (the raw commands)
 
 `shape_pass.sh` is the normal path. Run the raw commands only for a one-off (a
 single `sweep`, or a single-image run `shape_pass.sh` doesn't drive). The sequence
 per pass is `render.sh` → per frame `composite.py` **and** `depth.py` →
-`self_intersection.py` → `aggregate.py`. `PASS_DIR` is the
+`self_intersection.py` → `aggregate.py`.
+Insert `critic.py` only for selected coverage/suspect frames. `PASS_DIR` is the
 output directory `render.sh` printed; `PI3X` is the capture's tracking dir
 (`CAPTURE/tracking`; the capture root also works for the analysis tools).
 
@@ -367,12 +397,20 @@ micromamba run -n artscript env PYTHONPATH=harness python -m analysis.scorers.de
     --mask <frame mask> --source <frame image> --frame-name <frame> \
     [--hand-mask <hand mask>] --out PASS_DIR/depth_<frame>.json
 
-# 4. the turntable sheets — one page per articulation state (shape_pass.sh does this
+# 4. selected frames only — optional VLM screen; note the state-keyed glob:
+micromamba run -n artscript env PYTHONPATH=harness python -m analysis.scorers.critic \
+    --source <frame image> --render PASS_DIR/match_<frame>.png \
+    --overlap PASS_DIR/overlap_<frame>.png \
+    --turntable 'PASS_DIR/turntable_*_az*_el*.png' \
+    --metrics PASS_DIR/metrics_<frame>.json --depth PASS_DIR/depth_<frame>.json \
+    --frame <frame> --out PASS_DIR/critic_<frame>.json
+
+# 5. the turntable sheets — one page per articulation state (shape_pass.sh does this
 #    for you; run it by hand for an older pass):
 micromamba run -n artscript env PYTHONPATH=harness \
     python -m analysis.viz.turntable_sheet --pass-dir PASS_DIR
 
-# 5. roll-up:
+# 6. roll-up:
 micromamba run -n artscript env PYTHONPATH=harness python -m analysis.rollup.aggregate \
     --run-dir RUN_DIR --views-dir PASS_DIR
 ```

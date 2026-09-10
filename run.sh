@@ -45,6 +45,11 @@
 # Both ignored on a --no-timestamp re-run that reuses an existing run_config.json
 # (that file is kept, not rewritten).
 #
+# --critic-provider auto|anthropic|openai pins the VLM critic's backend in
+# RUN_DIR/run_config.json (harness/analysis/scorers/critic/critic.md). auto (the
+# default) uses whichever API key the sandbox has: the agent's own, or the second
+# key tools/install_*_bwrap.sh stored for the other provider.
+#
 # --candidate-sheet-max-dimension N targets derived candidate-sheet previews
 # (0 = no preview). Canonical pages stay native; previews never downsample below
 # 0.5x native linear resolution. Recorded before the agent starts.
@@ -165,6 +170,7 @@ TIMEOUT_HOURS=""
 CODEX_PROVIDER="${ARTSCRIPT_CODEX_PROVIDER:-}"
 AGENT="${ARTSCRIPT_AGENT:-codex}"
 CLAUDE_PROVIDER="${ARTSCRIPT_CLAUDE_PROVIDER:-}"
+CRITIC_PROVIDER="${ARTSCRIPT_CRITIC_PROVIDER:-}"
 ENABLE_MODULES=()
 DISABLE_MODULES=()
 [ -z "${ARTSCRIPT_ENABLE_MODULES:-}" ] || ENABLE_MODULES+=("$ARTSCRIPT_ENABLE_MODULES")
@@ -252,6 +258,11 @@ while [ "$#" -gt 0 ]; do
       CLAUDE_PROVIDER="$2"
       shift 2
       ;;
+    --critic-provider)
+      [ "$#" -ge 2 ] || { echo "error: --critic-provider requires auto, anthropic or openai" >&2; exit 2; }
+      CRITIC_PROVIDER="$2"
+      shift 2
+      ;;
     --resume-run)
       [ "$#" -ge 2 ] || { echo "error: --resume-run requires a run directory" >&2; exit 2; }
       RESUME_RUN="$2"
@@ -279,6 +290,10 @@ esac
 case "$CLAUDE_PROVIDER" in
   "" | anthropic) ;;
   *) echo "error: --claude-provider must be anthropic, got '$CLAUDE_PROVIDER'" >&2; exit 2 ;;
+esac
+case "$CRITIC_PROVIDER" in
+  "" | auto | anthropic | openai) ;;
+  *) echo "error: --critic-provider must be auto, anthropic or openai, got '$CRITIC_PROVIDER'" >&2; exit 2 ;;
 esac
 # Module names are validated against the registry up front, so a typo fails
 # here rather than scaffolding a run with the wrong gate set.
@@ -402,6 +417,7 @@ fi
 
 CODEX_PROVIDER="${CODEX_PROVIDER:-openai}"
 CLAUDE_PROVIDER="${CLAUDE_PROVIDER:-anthropic}"
+CRITIC_PROVIDER="${CRITIC_PROVIDER:-auto}"
 
 [ "$DETACH" -eq 0 ] || [ "$LAUNCH_CODEX" -eq 1 ] || {
   echo "error: --detach requires an agent launch" >&2
@@ -559,10 +575,11 @@ print(backend)
 PY
 }
 
-# Scaffold RUN_DIR/run_config.json — a starter config for shape_pass.sh's G/N
-# concurrency knobs + visual presentation (precedence: CLI flag > this json >
-# built-in default; see harness/utils/shape_pass.md). The production profile itself
-# (pool on, 16 workers/ncpu per GPU, alpha-backed panels) lives beside the schema in
+# Scaffold RUN_DIR/run_config.json — a starter config for shape_pass.sh's G/N/C
+# concurrency knobs + visual presentation + the VLM-critic backend (precedence:
+# CLI flag > this json > built-in default; see harness/utils/shape_pass.md). The
+# production profile itself (pool on, 16 workers/ncpu per GPU, alpha-backed
+# panels, one critic worker) lives beside the schema in
 # harness/utils/_run_config.py:scaffold_config — NOT here — so the scaffold and
 # the config reader can't drift apart. Guarded on existence: a --no-timestamp
 # re-run never clobbers a hand-edited config (unlike layout.json/
@@ -575,7 +592,8 @@ write_run_config() {
     --workers "${WORKERS:-16}" --ncpu "${NCPU:-16}" --gpus "${GPUS:-0}" \
     --candidate-sheet-max-dimension "$CANDIDATE_SHEET_MAX_DIMENSION" \
     --side-by-side-max-dimension "$SIDE_BY_SIDE_MAX_DIMENSION" \
-    --keep-spools "$KEEP_SPOOLS"
+    --keep-spools "$KEEP_SPOOLS" \
+    --critic-provider "$CRITIC_PROVIDER"
 }
 
 # ---- multi-frame (capture) path -----------------------------------------------
@@ -775,7 +793,7 @@ PROMPT_EOF
   exit 0
 fi
 
-echo "usage: run.sh --capture DIR [--agent codex|claude] [--codex-provider openai] [--claude-provider anthropic] [--runs-root DIR] [--frames \"a.jpg,b.jpg\" | --every 10] [--skip-frames N] [--max-kfs N] [--workers N] [--ncpu N] [--candidate-sheet-max-dimension N] [--side-by-side-max-dimension N] [--timeout-hours HOURS] [--gpu N | --gpus \"1,2\"] [run_name] [--start N] [--stop N] [--no-depth-cost] [--no-depth-report] [--no-depth-render] [--enable MODULE] [--disable MODULE] [--no-timestamp] [--prompt-only] [--detach] [--direct]" >&2
+echo "usage: run.sh --capture DIR [--agent codex|claude] [--codex-provider openai] [--claude-provider anthropic] [--critic-provider auto|anthropic|openai] [--runs-root DIR] [--frames \"a.jpg,b.jpg\" | --every 10] [--skip-frames N] [--max-kfs N] [--workers N] [--ncpu N] [--candidate-sheet-max-dimension N] [--side-by-side-max-dimension N] [--timeout-hours HOURS] [--gpu N | --gpus \"1,2\"] [run_name] [--start N] [--stop N] [--no-depth-cost] [--no-depth-report] [--no-depth-render] [--enable MODULE] [--disable MODULE] [--no-timestamp] [--prompt-only] [--detach] [--direct]" >&2
 echo "       run.sh --resume-run RUN_DIR [--detach]" >&2
 echo "(build a capture from frames + masks with tools/make_capture.py)" >&2
 exit 2

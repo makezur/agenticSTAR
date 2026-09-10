@@ -41,8 +41,8 @@ placement, and it is meaningless when you're in the *wrong* neighbourhood (far o
 the geometry itself is wrong). There is deliberately **no** bbox-normalized
 "shape-only" IoU — a normalized number invited deciding shape from a metric instead of
 from the signals that actually see it. Make the shape/pose/joint call from the
-**turntable** (coherence, per state), direct source/render comparisons, the
-**aspect-ratio hint** above, and the **per-frame
+**turntable** (coherence, per state), the **VLM critic's** tagged fix (imprecise but
+global — it sees what IoU can't), the **aspect-ratio hint** above, and the **per-frame
 IoU spread** (a defect in *every* frame ⇒ shape; a low score in *one* frame ⇒ pose).
 See AGENT_TASK.md "Shape vs. pose vs. articulation".
 

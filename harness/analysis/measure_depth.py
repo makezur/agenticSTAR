@@ -201,11 +201,11 @@ _MULTI_NOTES = (
     "deepest single view, widen toward canonical_ratios_spread.short.max if "
     "depth reads thin). base.intrinsics_for_render -> render.sh --intrinsics "
     "(or just pass --tracking, which applies each frame's K automatically). "
-    "This tool measures POSE only and does NOT decide moved — make the "
-    "moved-vs-articulated call from the source/render comparison. A frame's seed_pose "
+    "This tool measures POSE only and does NOT decide moved — the VLM critic "
+    "(critic.py) owns the moved-vs-articulated call; trust it. A frame's seed_pose "
     "ROTATION is a camera-motion guess that a genuine re-grip may invalidate — the "
     "translation is still measured (correct), so keep it and re-orient with the "
-    "sweep; if the images show articulation, model it with a JOINT (the base pose "
+    "sweep; if the critic says articulation, model it with a JOINT (the base pose "
     "stays). SCALE + canonical_ratios are invariant to rigid motion, so "
     "moved/articulated frames stay in the fuse. Verify with depth.py per frame + "
     "aggregate.py's cross-frame report.")
@@ -339,7 +339,7 @@ def _seed_poses(per_frame, ref_report, tracking_dir):
     lines = [
         '# measured per-frame poses — paste each "pose": {...} INTO the matching',
         '# FRAMES entry, leaving that entry\'s "moved" / "joints" untouched. This',
-        '# tool measures POSE only; decide "moved" from the images.',
+        '# tool measures POSE only; it does NOT decide "moved" (the critic does).',
     ]
     for rep in per_frame:
         name = rep.get("frame_name")

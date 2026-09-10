@@ -1,1 +1,1 @@
-"""scorers — per-frame scoring tools (silhouette and depth)."""
+"""scorers — per-frame scoring tools (silhouette, depth, critic)."""

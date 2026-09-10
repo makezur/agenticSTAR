@@ -17,3 +17,5 @@ dependencies:
   - pip
   - pip:
     - manifold3d  # boolean + watertight backend for trimesh (pip only)
+    - anthropic   # VLM critic backend (harness/analysis/scorers/critic), --provider anthropic
+    - openai      # VLM critic backend, --provider openai

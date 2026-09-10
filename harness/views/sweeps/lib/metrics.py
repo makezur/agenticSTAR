@@ -640,7 +640,7 @@ def dof_stats_lines(dof_stats_map, kinds):
                f"{'YES' if c.get('at_boundary') else 'no':>8}")
         lines.append(row)
     tail = ("For a NOT-pinned DOF (barely-moving or a wide plateau) do NOT paste its "
-            "swept value as ground truth — set it from the photo and visual "
+            "swept value as ground truth — set it from the photo / the critic's "
             "directional read and use the sweep only to refine within the range the "
             "photo supports.")
     lines.append(tail)
