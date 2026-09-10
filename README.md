@@ -23,7 +23,8 @@ is [AGENT_TASK.md](AGENT_TASK.md); the `scene.py` contract is in
 The repo was designed and tested with GPT-5.6-Sol and Claude Fable 5. The
 results in the paper were obtained with the mechanism module turned on
 (`--enable mechanism`; it is off by default). Newer models tend to do better
-with it off.
+with it off. The GPT-5.6-Sol results were obtained with the `critic` branch,
+which adds a second VLM as a critic; newer models should work fine without it.
 
 ## Installation
 
