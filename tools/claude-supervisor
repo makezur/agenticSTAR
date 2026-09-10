@@ -1,0 +1,1717 @@
+#!/usr/bin/env python3
+"""Run an interactive Claude Code agent in tmux and recover transient failures.
+
+Mirror of tools/agent-supervisor (the Codex supervisor) for the Claude Code
+backend. The tmux/pty plumbing, the backoff ladders, the rotation budget, the
+run deadline and the state.json contract an external collector can poll are
+the same. What differs is how the agent is observed and steered:
+
+- The session id is chosen up front (``claude --session-id``), so the transcript
+  is found by name under ``<claude-home>/projects/*/<id>.jsonl`` instead of
+  discovered by content; ``claude --resume <id>`` reopens and appends to it.
+- A turn ends with an ``assistant`` line whose ``stop_reason`` is ``end_turn``;
+  an API failure is an ``assistant`` line flagged ``isApiErrorMessage`` with the
+  error code in ``error``. Subagent traffic is ``isSidechain`` and ignored.
+- Claude Code has no goal store: an agent that gives up says so in its final
+  message (GAVE_UP_RE), an agent that stops to ask a question is nudged on in
+  the same session (``awaiting_input``), and a completed turn is followed by the
+  supervisor stopping the idle TUI after COMPLETE_GRACE_SECONDS so the run
+  reaches a terminal ``exited`` status on its own.
+- That last stop must also account for *background subagents*. Each writes to
+  ``<transcript-stem>/subagents/agent-<id>.{jsonl,meta.json}``, a sibling tree
+  of the session transcript, and an orchestrator that spawns a batch ends its
+  turn to wait for them -- so the file this supervisor tails goes silent while
+  the run is at its busiest. Stopping on the parent's quiet alone kills the
+  batch and records the truncated run as a clean success. The batch is counted
+  from the transcript itself: the ``Agent`` tool call returns *immediately* for
+  a background agent (a ``tool_result`` reading "Async agent launched"), and the
+  agent reports back later as a ``<task-notification>`` naming the launching
+  ``tool_use`` id -- as a user message, or only as a ``queue-operation`` line
+  when the orchestrator was mid-turn. Only the notification means the agent
+  is done, and only until the orchestrator resumes it: a ``SendMessage`` to a
+  reported agent rewrites its meta.json, and that agent is outstanding again.
+- Every transcript this supervisor discovers is listed in ``state.json`` under
+  ``transcripts`` so an external collector can archive them.
+  They live outside the run dir and are the only record of what a batch did.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import pty
+import re
+import selectors
+import shlex
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+BACKOFF = (5, 15, 30, 60, 120, 300)
+# A rate limit is not a crash loop: it is shared account load, every run
+# launched in the same batch shares it, and it clears on its own. Retrying it on
+# the transient ladder is actively wrong -- that ladder opens at 5s, the client
+# has *already* exhausted its own internal retries to surface the error at all
+# ("exceeded retry limit, last status: 429"), and six failures spent that fast
+# would tear down an hour-old run inside nine minutes. So wait long enough for
+# the window to actually reopen. The rotation limit remains the failure budget.
+RATE_LIMIT_BACKOFF = (60, 180, 300, 600, 900, 1800)
+# A usage limit is the account's own time window, not thread damage: a fresh
+# thread hits the same wall instantly, so rotating for one just burns the
+# budget. Wait out the window and resume the exact thread instead. The ladder
+# opens well above the rate-limit one because these windows reset on the hour.
+USAGE_LIMIT_BACKOFF = (900, 1800, 3600)
+MAX_ROTATIONS = 10
+RECOVERABLE_FAILURES = frozenset(
+    {"transient", "rate_limited", "usage_limited", "unclassified", "awaiting_input"}
+)
+# Throttling clears on its own, so a resume that re-hits it quickly is the
+# expected shape of a shared window, not evidence the thread is damaged --
+# these never trigger the failed-recovery rotation.
+THROTTLE_FAILURES = frozenset({"rate_limited", "usage_limited"})
+# Failures that never mean the session is damaged, so a resume that promptly
+# re-hits one is not "same-thread recovery did not hold": throttling is the
+# account's shared window, and a question is the agent pausing for input.
+SAME_SESSION_FAILURES = THROTTLE_FAILURES | frozenset({"awaiting_input"})
+IMMEDIATE_ROTATION_FAILURES = frozenset({"request_too_large", "budget_limited"})
+# Failures no retry can fix: the run needs a human.
+FATAL_FAILURES = frozenset({"discovery_failed", "auth_failed"})
+# Claude Code's TUI does not exit when a turn ends; it waits for the next prompt.
+# Once the transcript shows a clean end_turn, wait this long for anything else to
+# happen (a human attached and typing, a straggling event), then stop the agent so
+# the detached run reaches a terminal status instead of idling until the deadline.
+# 0 disables the auto-stop. A live background batch is NOT this question: see
+# SUBAGENT_QUIET_SECONDS.
+COMPLETE_GRACE_SECONDS = 20.0
+# Where a session's background agents write. Sibling of ``<id>.jsonl``, so an
+# orchestrator waiting on a batch leaves the tailed transcript untouched while
+# these files grow -- the run deadline, not this grace, bounds such a wait.
+SUBAGENT_DIR_NAME = "subagents"
+# What the Agent tool returns the moment a background agent is spawned. It is a
+# ``tool_result`` under the launching ``tool_use`` id, so a supervisor that took
+# any ``tool_result`` for "the agent reported back" would count the whole batch
+# as merged before the orchestrator's turn even ended. The real report-back is a
+# ``<task-notification>`` carrying the same id (TASK_NOTIFICATION_RE), whether
+# it lands as a user message or only as a ``queue-operation`` enqueue.
+LAUNCH_ACK_PREFIX = "Async agent launched"
+TASK_NOTIFICATION_RE = re.compile(r"<tool-use-id>\s*([^<\s]+)\s*</tool-use-id>")
+# Backstop for a batch that never reports back at all. Deliberately NOT
+# COMPLETE_GRACE_SECONDS: that window asks "is anything about to follow this
+# turn", which 20s answers, while this one asks "is a batch that owes me a
+# tool_result ever going to send one" -- and a refiner spends whole minutes inside
+# a single sweep or render without writing a transcript line.
+#
+# An hour, where Codex uses half of one, because the two supervisors lean on this
+# number differently. For Codex, silence IS the test (paired only with a stalled
+# goal status), so its bound has to stay near the longest silence a live batch
+# produces. Here the exact outstanding count decides, and this fires only when an
+# agent dies without ever reporting -- so the errors are lopsided: too tight cuts
+# a live batch off through the back door, while too loose costs one wedged GPU
+# until the run deadline, on a run already lost. Buy the safe direction.
+SUBAGENT_QUIET_SECONDS = 3600.0
+# The transient counter controls backoff, but does not stop the run. A clean
+# task_complete or a long-lived attempt resets it; fresh-thread rotations are
+# the bounded recovery operation.
+PROGRESS_SECONDS = 120.0
+# Backstop for that reset: a run failing just past the progress threshold every
+# time would otherwise retry forever.
+MAX_TOTAL_ATTEMPTS = 40
+ANSI_RE = re.compile(
+    rb"(?:\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-_][0-?]*[ -/]*[@-~])"
+)
+OVERSIZE_RE = re.compile(
+    r"request_too_large|request exceeds the maximum allowed size|"
+    r"prompt is too long|prompt_too_long|context_length_exceeded", re.I
+)
+# ``(?:ed|[_ ]reached)`` covers the structured code (usage_limit_reached), the
+# prose ("Usage limit reached"), and the adjective ("usage limited") -- but not
+# a bare "usage limit", which agent prose uses innocently.
+USAGE_LIMIT_RE = re.compile(
+    r"usage[_ ]limit(?:ed|[_ ]reached)|usage quota (?:exhausted|reached)", re.I
+)
+BUDGET_LIMIT_RE = re.compile(
+    r"budget[_ ]limit(?:ed|[_ ]reached)|token budget (?:exhausted|reached)", re.I
+)
+# Throttling. The canonical shape this arrives in is the client giving up:
+# "exceeded retry limit, last status: 429 Too Many Requests". A bare 429 needs
+# the same http/status/error context every other bare code needs, but the reason
+# phrase and the error codes are unambiguous on their own. Kept ahead of
+# TRANSIENT_RE by classify_text, because that message also carries the word
+# "retry" and a burst of them is not a crash loop.
+RATE_LIMIT_RE = re.compile(
+    r"too many requests|rate[_ ]?limit(?:ed|_exceeded|s)?|"
+    # A trailing decimal makes it a measurement, not a status: the agent reports
+    # "median error 429.3mm" constantly, and \b alone accepts the dot.
+    r"\b(?:http(?:\s+status)?|status|error)\s*[:=]?\s*429\b(?!\.\d)|"
+    r"\bquota\s+exceeded\b",
+    re.I,
+)
+# Bare status codes need an http/status/error context: agent output is full of
+# frame counts and sample sizes ("1500 samples"), and the canonical reason
+# phrases ("Bad Gateway", "Service Unavailable") are matched on their own.
+# A bare "timeout" needs one too: the agent wraps its own shell commands in
+# timeout(1) ("timeout --signal=INT --kill-after=10s 120s micromamba run ..."),
+# so the word alone appears in perfectly healthy output.
+#
+# "Stream disconnected before completion" is the response stream dying mid-turn,
+# and the TUI's own "Reconnecting... 1/5" ladder can exhaust without any of the
+# suffixes matching: the observed tails are "idle timeout waiting for SSE", a
+# prose "The server had an error while processing your request", and "Transport
+# error: network error: error decoding response body". Only the fourth
+# ("Transport error: timeout") hit a pattern, so the same outage classified
+# three different ways. The prefix is unambiguous on its own -- nothing healthy
+# reports a disconnected stream -- so match it without requiring the suffix.
+# "Transport error" keeps its colon: bare, it would swallow the transport error
+# of an optimal-transport loss, which is ordinary geometry vocabulary here.
+TRANSIENT_RE = re.compile(
+    r"internal[_ ]server[_ ]error|"
+    # Claude Code prints its own API failures as "API Error: <reason>", and the
+    # reasons seen so far ("Server error mid-response", "The operation timed
+    # out", "unexpected error during processing") are all outages. 529 is
+    # Anthropic's overloaded status.
+    r"api error:|server error mid-response|overloaded(?:_error)?|"
+    r"\b(?:http(?:\s+status)?|status|error)\s*[:=]?\s*(?:500|502|503|504|529)\b(?!\.\d)|"
+    r"\btimed\s+out\b|request_timeout|"
+    r"\b(?:error|stream|request|connection|read|write)\s*[:=]?\s*time\s*out\b|"
+    r"connection (?:reset|closed|aborted)|"
+    r"stream disconnected|idle timeout waiting for sse|transport error\s*:|"
+    r"connectionreseterror|service unavailable|bad gateway|gateway timeout",
+    re.I,
+)
+# An agent that gives up ends its turn cleanly, so only its wording separates a
+# surrender from a delivery. Match the inability *and* its object: a healthy
+# final summary routinely says it could not complete some sub-step ("I couldn't
+# complete the rz sweep, so I fixed the hinge and all gates pass"), and only an
+# abandonment aims that inability at the whole run. The apostrophe may be either
+# ASCII or the U+2019 the model actually emits.
+GAVE_UP_RE = re.compile(
+    r"\b(?:could\s*n[o']?t|couldn['’]t|can\s*not|cannot|can['’]t|"
+    r"(?:was|were|am|are)\s+(?:not\s+able|unable)\s+to|"
+    r"(?:was|were)n['’]?t\s+able\s+to|unable\s+to)\s+"
+    r"(?:fully\s+|successfully\s+|actually\s+)?"
+    r"(?:complete|finish|deliver|produce)\b[^.\n]{0,80}?"
+    r"\b(?:reconstruction|run|goal|objective|task|assignment)\b",
+    re.I,
+)
+# A failure the terminal attributes to an agent id belongs to a spawned subagent,
+# not to the session being supervised. See strip_thread_errors. Only the terminal
+# fallback needs this: in the transcript, subagent traffic is isSidechain and
+# classify_event skips it.
+THREAD_ERROR_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"\s*:[^\n]*\berror[^\n]*",
+    re.I,
+)
+
+
+def atomic_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def session_name(run_dir: Path) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_-]+", "-", run_dir.name).strip("-") or "run"
+    digest = hashlib.sha256(str(run_dir).encode()).hexdigest()[:8]
+    return f"agent-{clean[:64]}-{digest}"
+
+
+def sandbox_run_dir(run_dir: Path) -> str:
+    return f"/home/ubuntu/articulated_script/runs/{run_dir.name}"
+
+
+def classify_text(text: str) -> str | None:
+    if OVERSIZE_RE.search(text):
+        return "request_too_large"
+    if USAGE_LIMIT_RE.search(text):
+        return "usage_limited"
+    if BUDGET_LIMIT_RE.search(text):
+        return "budget_limited"
+    # Before transient: the message that carries a 429 is itself a report of
+    # exhausted retries, and its own words ("exceeded retry limit") would read as
+    # a generic failure. Throttling needs the long ladder, not the 5s one.
+    if RATE_LIMIT_RE.search(text):
+        return "rate_limited"
+    if TRANSIENT_RE.search(text):
+        return "transient"
+    return None
+
+
+def structured_error_values(value: Any) -> list[Any]:
+    """Extract structured error values, including JSON embedded in strings."""
+    values: list[Any] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in {"code", "status", "status_code", "type"}:
+                values.append(item)
+            values.extend(structured_error_values(item))
+    elif isinstance(value, list):
+        for item in value:
+            values.extend(structured_error_values(item))
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                values.extend(structured_error_values(json.loads(stripped)))
+            except json.JSONDecodeError:
+                pass
+    return values
+
+
+def classify_error(error: Any) -> str:
+    """Prefer exact structured fields, then fall back to human-readable text."""
+    values = {
+        str(value).strip().lower().replace("-", "_")
+        for value in structured_error_values(error)
+    }
+    if values & {"request_too_large", "context_length_exceeded", "prompt_too_long"}:
+        return "request_too_large"
+    # Claude Code stamps the transcript's API-error line with a bare code; these
+    # are the ones it emits for credentials. Nothing a retry fixes.
+    if values & {
+        "authentication_failed",
+        "authentication_error",
+        "permission_error",
+        "401",
+        "403",
+    }:
+        return "auth_failed"
+    if values & {"usage_limited", "usage_limit_reached"}:
+        return "usage_limited"
+    if values & {"budget_limited", "budget_limit_reached"}:
+        return "budget_limited"
+    if values & {
+        "429",
+        "rate_limit_exceeded",
+        "rate_limited",
+        "rate_limit",
+        "rate_limit_error",
+    }:
+        return "rate_limited"
+    if values & {
+        "500",
+        "502",
+        "503",
+        "504",
+        "529",
+        "internal_server_error",
+        "request_timeout",
+        # Claude Code's own codes for a dead or overloaded request.
+        "server_error",
+        "api_error",
+        "overloaded",
+        "overloaded_error",
+        "timeout",
+        "unknown",
+    }:
+        return "transient"
+    return classify_text(event_text(error)) or "unclassified"
+
+
+def strip_thread_errors(text: str) -> str:
+    """Drop failures the terminal attributes to a spawned subagent.
+
+    A window refiner's outage can surface on the orchestrator's own terminal as
+    ``<agent-id>: Error - Internal server error`` while the orchestrator is
+    already handling it -- respawning that window against the same immutable
+    brief. Reading it as the supervised session's failure tears down a healthy
+    orchestrator and kills every other live window with it.
+
+    Consume the whole line, so no fragment of it can be classified either.
+    """
+    return THREAD_ERROR_RE.sub(" <subagent failure> ", text)
+
+
+def event_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(event_text(item) for item in value.values())
+    if isinstance(value, list):
+        return " ".join(event_text(item) for item in value)
+    return ""
+
+
+def assistant_text(message: dict[str, Any]) -> str:
+    """The text blocks of one assistant message, joined."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text", "")))
+    return "\n".join(parts)
+
+
+def block_text(block: dict[str, Any]) -> str:
+    """The text of one ``tool_result`` block (``content`` is a string or text blocks)."""
+    return assistant_text(block)
+
+
+def event_time(event: dict[str, Any]) -> float:
+    """When a transcript line was written, as a wall clock to compare with mtimes.
+
+    Claude Code stamps every line ``timestamp: 2026-09-04T00:19:58.477Z``. That
+    is preferred over the moment the supervisor happens to read the line: after
+    a stall the tail catches up on a backlog, and a report read late would
+    otherwise look newer than a resume that really came after it. Lines without
+    a parseable stamp fall back to now.
+    """
+    stamp = event.get("timestamp")
+    if isinstance(stamp, str):
+        try:
+            parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except ValueError:
+            try:
+                parsed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                parsed = None
+        if parsed is not None:
+            return parsed.replace(tzinfo=timezone.utc).timestamp()
+    return time.time()
+
+
+def classify_event(event: dict[str, Any]) -> tuple[str | None, bool]:
+    """Return (failure class, successful task completion) for one transcript line.
+
+    Claude Code appends one JSON object per line to the session transcript. The
+    lines that matter are ``assistant`` messages: one flagged ``isApiErrorMessage``
+    is a failed request (its ``error`` field carries the code, its text the
+    "API Error: ..." reason), and one whose ``stop_reason`` is ``end_turn`` is the
+    end of the agent's turn. Tool calls are ``tool_use`` stops and ordinary
+    progress. ``isSidechain`` lines belong to spawned subagents and are the
+    orchestrator's to handle.
+
+    An ``end_turn`` is not automatically a win. An agent that abandons the
+    reconstruction ends its turn cleanly and apologises -- "I couldn't complete
+    the reconstruction within this run." -- which is a *stall*: it leaves the run
+    dir short of its gates. And an agent that stops to ask ("Should I proceed
+    with the hinge?") has paused for input that, unattended, never comes; that
+    is ``awaiting_input``, resumed in place with a nudge rather than rotated.
+    """
+    if event.get("type") != "assistant" or event.get("isSidechain"):
+        return None, False
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None, False
+    if event.get("isApiErrorMessage"):
+        error = {"code": event.get("error"), "message": assistant_text(message)}
+        return classify_error(error), False
+    if message.get("stop_reason") != "end_turn":
+        return None, False
+    text = assistant_text(message)
+    if GAVE_UP_RE.search(text):
+        return "goal_stalled", False
+    if text.rstrip().endswith("?"):
+        return "awaiting_input", False
+    return None, True
+
+
+CONTINUATION_PROMPT = "Continue the active goal from where it was interrupted."
+NUDGE_PROMPT = (
+    "This run is unattended: nobody can answer questions. Decide yourself, "
+    "recording the decision and its reasoning in NOTES.md, and continue the goal "
+    "in AGENT_TASK.md through completion without stopping to ask again."
+)
+
+
+def recovery_prompt(run_dir: Path) -> str:
+    sandbox = sandbox_run_dir(run_dir)
+    return (
+        "Recover and continue the interrupted reconstruction in RUN_DIR="
+        f"{sandbox}. First run `PYTHONPATH=harness python -m bookkeeping status "
+        f"--run-dir {sandbox}`. Inspect its active iteration, NOTES.md, scene.py, "
+        "the latest reports and rendered side-by-sides, window state, and "
+        "incomplete spool ledgers before "
+        "acting. Preserve valid existing work, determine the unfinished step, "
+        "then continue the goal in AGENT_TASK.md through completion."
+    )
+
+
+def stall_prompt(run_dir: Path) -> str:
+    """Prompt for the thread that replaces one which gave up.
+
+    The previous thread declared an impasse, so this one must not inherit its
+    conclusion: name the impasse as the thing to re-examine, and point at the
+    evidence on disk rather than at the abandoned reasoning.
+    """
+    sandbox = sandbox_run_dir(run_dir)
+    return (
+        "Continue the reconstruction in RUN_DIR="
+        f"{sandbox}. The previous thread reached an impasse and stopped without "
+        "finishing; its goal is abandoned, and this is a fresh attempt at the "
+        "same objective. First run `PYTHONPATH=harness python -m bookkeeping "
+        f"status --run-dir {sandbox}`. Re-derive the state from its active "
+        "iteration, NOTES.md, scene.py, the newest reports, rendered "
+        "side-by-sides, window state, and incomplete spool ledgers, and treat "
+        "the previous thread's "
+        "conclusions as unproven. Identify what actually blocked it, keep the "
+        "work that verifies, discard what does not, and take a different "
+        "approach to the step it could not finish. Then carry the goal in "
+        "AGENT_TASK.md through completion."
+    )
+
+
+class Supervisor:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.run_dir = Path(args.run_dir).resolve()
+        self.sup_dir = self.run_dir / "supervisor"
+        self.state_path = self.sup_dir / "state.json"
+        self.stop_path = self.sup_dir / "stop"
+        self.combined_path = self.sup_dir / "combined.log"
+        self.state = read_json(self.state_path)
+        self.child_pid: int | None = None
+        self.master_fd: int | None = None
+        self.stop_requested = False
+        self.detected: str | None = None
+        self.rollout: Path | None = None
+        self.rollout_offset = 0
+        self.fallback_buffer = ""
+        self.attempt_started = 0.0
+        self.lock_handle: Any = None
+        self.rollout_touched = 0.0
+        self.completed_at = 0.0
+        self.completed = False
+        self.subagent_mtime = 0.0
+        self.subagent_touched = 0.0
+        # ``tool_use`` id -> wall clock of the LAST time its agent reported back:
+        # a ``<task-notification>`` naming the id (background agents) or a
+        # ``tool_result`` that is not the launch acknowledgement (foreground
+        # ones). A spawned agent whose id is not in here is outstanding; so is
+        # one whose meta.json was rewritten after that report, because that is
+        # what a SendMessage resume does (see ``outstanding_subagents``).
+        self.subagent_results: dict[str, float] = {}
+        # Wall clock of the current attempt's launch. Subagents do not outlive
+        # the process that spawned them, so a meta.json older than this belongs
+        # to a previous attempt of a resumed session and is not outstanding.
+        self.attempt_launched_at = 0.0
+        self.completion_deferred = False
+        self.rotation_limit_value: int | None = None
+
+    def timeout_reached(self) -> bool:
+        """Request a clean stop once this run's persisted deadline has passed."""
+        deadline = self.state.get("deadline_at")
+        if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+            return False
+        if time.time() < deadline:
+            return False
+        if not self.stop_requested:
+            self.stop_requested = True
+            self.save(
+                status="stopping",
+                timeout_reached=True,
+                timeout_reason="deadline",
+            )
+            self.note("run deadline reached; stopping")
+        self.terminate_child()
+        return True
+
+    def save(self, **updates: Any) -> None:
+        self.state.update(updates)
+        self.state["updated_at"] = time.time()
+        atomic_json(self.state_path, self.state)
+
+    def note(self, message: str) -> None:
+        line = f"\n[supervisor {time.strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
+        with self.combined_path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+        try:
+            os.write(sys.stdout.fileno(), line.encode())
+        except OSError:
+            pass
+
+    def acquire_lock(self) -> None:
+        self.sup_dir.mkdir(parents=True, exist_ok=True)
+        self.lock_handle = (self.sup_dir / "lock").open("a+")
+        try:
+            fcntl.flock(self.lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"supervisor already active for {self.run_dir}")
+        self.stop_path.unlink(missing_ok=True)
+
+    def session_root(self) -> Path:
+        override = os.environ.get("AGENT_SUPERVISOR_SESSION_ROOT")
+        if override:
+            return Path(override)
+        claude_home = os.environ.get("HOST_CLAUDE_HOME")
+        config_home = Path(
+            os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+        )
+        config = config_home / "claude-articulated/paths.conf"
+        if not claude_home and config.is_file():
+            try:
+                for line in config.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("HOST_CLAUDE_HOME="):
+                        values = shlex.split(line.split("=", 1)[1], comments=True)
+                        if len(values) == 1:
+                            claude_home = os.path.expandvars(
+                                os.path.expanduser(values[0])
+                            )
+                        break
+            except (OSError, ValueError):
+                pass
+        if not claude_home:
+            state_home = Path(
+                os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+            )
+            claude_home = str(state_home / "claude-articulated/claude-home")
+        # Claude Code keeps one transcript per session under a per-project
+        # directory named after the working directory; the session id in the
+        # filename is what this supervisor chose, so the project dir is a glob.
+        return Path(claude_home) / "projects"
+
+    def discover_transcript(self, session_id: str) -> Path | None:
+        """The transcript Claude Code writes for ``session_id``, once it exists.
+
+        The id is the supervisor's own choice (``--session-id`` on a fresh launch,
+        the stored id on ``--resume``), so there is nothing to disambiguate: the
+        file is ``<projects>/<cwd-slug>/<id>.jsonl`` and only the slug is unknown.
+        """
+        matches = sorted(self.session_root().glob(f"*/{session_id}.jsonl"))
+        if len(matches) > 1:
+            names = ", ".join(str(path) for path in matches)
+            raise RuntimeError(f"ambiguous Claude transcript discovery: {names}")
+        return matches[0] if matches else None
+
+    def rollout_start(self, path: Path, baseline: dict[str, tuple[int, int]]) -> int:
+        """Byte offset of this attempt's first event in ``path``.
+
+        ``claude --resume`` reopens the *same* transcript and appends, so a resumed
+        session's file already holds the outage that caused the resume. Tailing
+        from byte 0 re-detects it, kills a healthy agent, and resumes again --
+        the same stale event forever, one restart per backoff, until the
+        total-attempt backstop trips. Skip whatever was already on disk when
+        this attempt launched; only events appended since then are ours.
+        """
+        prior = baseline.get(str(path))
+        if not prior:
+            return 0
+        try:
+            return min(prior[1], path.stat().st_size)
+        except OSError:
+            return prior[1]
+
+    def resize_child(self, *_: Any) -> None:
+        if self.master_fd is None:
+            return
+        try:
+            size = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, size)
+            if self.child_pid:
+                os.killpg(self.child_pid, signal.SIGWINCH)
+        except OSError:
+            pass
+
+    def terminate_child(self) -> None:
+        if not self.child_pid:
+            return
+        try:
+            os.killpg(self.child_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                pid, _ = os.waitpid(self.child_pid, os.WNOHANG)
+                if pid:
+                    self.child_pid = None
+                    return
+            except ChildProcessError:
+                self.child_pid = None
+                return
+            time.sleep(0.1)
+        try:
+            os.killpg(self.child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def handle_signal(self, signum: int, _frame: Any) -> None:
+        self.stop_requested = True
+        self.save(status="stopping", stop_signal=signum)
+        self.terminate_child()
+
+    def tail_rollout(self) -> None:
+        if not self.rollout:
+            return
+        try:
+            with self.rollout.open(encoding="utf-8", errors="replace") as handle:
+                handle.seek(self.rollout_offset)
+                while True:
+                    line_start = handle.tell()
+                    line = handle.readline()
+                    if not line:
+                        break
+                    if not line.endswith("\n"):
+                        handle.seek(line_start)
+                        break
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    failure, success = classify_event(event)
+                    if success:
+                        # A clean completion supersedes any earlier fallback
+                        # text match: don't let a stale detection terminate and
+                        # resume a session that just finished successfully.
+                        self.detected = None
+                        self.fallback_buffer = ""
+                        self.state["consecutive_transient_failures"] = 0
+                        self.state.pop("resume_recovery_session_id", None)
+                        self.state.pop("force_rotation_reason", None)
+                        # A completed turn proves the window reopened, so earlier
+                        # throttling is spent history, not a budget this run is
+                        # still burning down.
+                        self.state["rate_limits"] = 0
+                        self.state["usage_limits"] = 0
+                        self.save()
+                    if failure:
+                        self.detected = failure
+                        self.completed_at = 0.0
+                    self.note_subagent_results(event)
+                    if success and not self.completed_at:
+                        self.completed_at = time.monotonic()
+                    elif event.get("type") in {"user", "assistant"} and not success:
+                        # Someone (a human attached, or the agent itself) is still
+                        # talking: the earlier completion is no longer the end. A
+                        # batch reporting back arrives here too, so the next wait
+                        # is a new episode and gets its own notice.
+                        self.completed_at = 0.0
+                        self.completion_deferred = False
+                    self.rollout_touched = time.monotonic()
+                self.rollout_offset = handle.tell()
+        except OSError:
+            pass
+
+    def subagent_dir(self) -> Path | None:
+        """``<transcript-stem>/subagents``, where background agents transcribe."""
+        if not self.rollout:
+            return None
+        return self.rollout.with_suffix("") / SUBAGENT_DIR_NAME
+
+    def record_transcript(self, path: Path) -> None:
+        """List ``path`` in ``state.json`` so the collector can archive it.
+
+        Claude Code writes transcripts under its own home, not the run dir, and a
+        rotated run has one per attempt; without this list the zip that lands on
+        the results side holds no record of what the agent or its batch did.
+        """
+        transcripts = self.state.get("transcripts")
+        if not isinstance(transcripts, list):
+            transcripts = []
+        if str(path) not in transcripts:
+            transcripts.append(str(path))
+        self.state["transcripts"] = transcripts
+
+    def note_subagent_results(self, event: dict[str, Any]) -> None:
+        """Record every spawned agent the parent has heard back from.
+
+        A spawned agent is identified by the ``tool_use`` id that launched it, and
+        two kinds of parent-transcript line say it is finished:
+
+        - a ``<task-notification>`` user message naming the id in
+          ``<tool-use-id>``: how a *background* agent reports back, minutes or
+          hours after launch, whatever its status;
+        - a ``tool_result`` under the id whose text is not the launch
+          acknowledgement: a *foreground* agent's actual result.
+
+        The acknowledgement itself -- "Async agent launched successfully", a
+        ``tool_result`` written ~2s after the ``tool_use`` and at the same
+        instant as the agent's meta.json -- means the opposite of finished and is
+        skipped. Remembering the ids seen, and when, is all it takes to know
+        which spawned agents are outstanding; see ``outstanding_subagents``. Ids
+        are cheap and a run spawns tens of agents, not millions, so this never
+        needs pruning.
+
+        The notification does not always arrive as a ``user`` message. Claude Code
+        queues it first as a ``queue-operation`` line (``operation: enqueue``)
+        whose text sits in a TOP-LEVEL ``content`` string, no ``message`` key; if
+        the orchestrator is mid-turn the queue entry is then *absorbed*
+        (``operation: remove``, ``reason: absorbed_mid_turn``) and no ``user``
+        line ever follows, so the top-level string is scanned too.
+
+        A report is a report whatever its ``<status>``: a *failed* agent that is
+        never resumed must not hold the run open for an hour either. Resuming it
+        rewrites its meta.json, which is what un-reports it.
+        """
+        seen_at = event_time(event)
+        top_level = event.get("content")
+        if isinstance(top_level, str) and "<task-notification>" in top_level:
+            for tool_use_id in TASK_NOTIFICATION_RE.findall(top_level):
+                self.subagent_results[tool_use_id] = seen_at
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if isinstance(content, str):
+            for tool_use_id in TASK_NOTIFICATION_RE.findall(content):
+                self.subagent_results[tool_use_id] = seen_at
+            return
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get("type")
+            if kind == "text":
+                text = block.get("text")
+                if isinstance(text, str) and "<task-notification>" in text:
+                    for tool_use_id in TASK_NOTIFICATION_RE.findall(text):
+                        self.subagent_results[tool_use_id] = seen_at
+            elif kind == "tool_result":
+                tool_use_id = block.get("tool_use_id")
+                if not isinstance(tool_use_id, str):
+                    continue
+                if block_text(block).lstrip().startswith(LAUNCH_ACK_PREFIX):
+                    continue
+                self.subagent_results[tool_use_id] = seen_at
+
+    def outstanding_subagents(self) -> int:
+        """How many spawned background agents have not reported back yet.
+
+        This is the authoritative answer, not an inference from file activity.
+        Every agent Claude Code spawns writes ``subagents/agent-<id>.meta.json``
+        holding the ``toolUseId`` that launched it, at the instant of the launch
+        acknowledgement; the parent later collects a ``<task-notification>`` (or,
+        for a foreground agent, a real ``tool_result``) under that id -- see
+        ``note_subagent_results``. The difference between the two sets is the
+        outstanding batch: an exact count, immune to how often a working
+        subagent happens to flush its transcript.
+
+        A reported agent is not necessarily finished with. The orchestrator can
+        ``SendMessage`` it -- to re-stamp a fragment the merge refused, or to
+        restart one that died to an API error -- and the resumed agent keeps its
+        ``toolUseId``, so its next report carries the id that is already banked
+        and the batch would count as empty. The resume is visible on disk: Claude
+        Code rewrites the agent's meta.json at that instant (same content, new
+        mtime), and never at completion. So an agent whose meta.json is newer
+        than its last report is outstanding again, until the report that follows
+        the resume.
+
+        A ``--resume`` reopens the same session, so the directory also holds the
+        meta files of the previous attempt's agents; those died with their parent
+        and the tailed range never sees their notifications (``rollout_start``
+        skips it), so anything written before this attempt launched is skipped.
+        Missing or malformed meta files are skipped rather than guessed at.
+        """
+        directory = self.subagent_dir()
+        if directory is None:
+            return 0
+        outstanding = 0
+        try:
+            metas = list(directory.glob("*.meta.json"))
+        except OSError:
+            return 0
+        for meta in metas:
+            try:
+                written_at = meta.stat().st_mtime
+                if written_at < self.attempt_launched_at:
+                    continue
+                spawned = json.loads(meta.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            tool_use_id = spawned.get("toolUseId") if isinstance(spawned, dict) else None
+            if not isinstance(tool_use_id, str):
+                continue
+            reported_at = self.subagent_results.get(tool_use_id)
+            if reported_at is None or written_at > reported_at:
+                outstanding += 1
+        return outstanding
+
+    def tail_subagents(self) -> int:
+        """Note whether any background agent has written since the last poll.
+
+        Their transcripts are a separate tree, so tailing the session file says
+        nothing about them: an orchestrator that spawns a batch and ends its turn
+        to wait looks idle for as long as the batch runs. Watch mtimes instead of
+        parsing -- what a subagent *decided* is the orchestrator's business, and
+        all this needs to know is that one is alive.
+
+        Timestamps are compared against the previously observed mtime and the
+        result recorded on the monotonic clock, so a container's wall clock or an
+        filesystem mtime granularity cannot make a live batch look stale.
+
+        The count returned is informational only -- the agents whose transcripts
+        moved alongside the newest one; ``outstanding_subagents`` is what decides.
+        """
+        directory = self.subagent_dir()
+        if directory is None:
+            return 0
+        mtimes = []
+        try:
+            for path in directory.glob("*.jsonl"):
+                try:
+                    mtimes.append(path.stat().st_mtime)
+                except OSError:
+                    continue
+        except OSError:
+            return 0
+        if not mtimes:
+            return 0
+        newest = max(mtimes)
+        if newest > self.subagent_mtime:
+            self.subagent_mtime = newest
+            self.subagent_touched = time.monotonic()
+        return sum(1 for m in mtimes if newest - m < subagent_quiet_seconds())
+
+    def process_output(self, data: bytes, raw: Any, combined: Any) -> None:
+        raw.write(data)
+        raw.flush()
+        clean = ANSI_RE.sub(b"", data).replace(b"\r", b"")
+        combined.write(clean.decode("utf-8", errors="replace"))
+        combined.flush()
+        self.fallback_buffer = (
+            self.fallback_buffer + clean.decode("utf-8", errors="replace")
+        )[-8192:]
+        # Terminal text is only a fallback: once the transcript is discovered its
+        # structured assistant events are authoritative, and agent output
+        # (logs, tracebacks it reads, tool results) would otherwise trip the
+        # patterns on healthy runs.
+        if self.rollout is None:
+            fallback = classify_text(strip_thread_errors(self.fallback_buffer))
+            if fallback:
+                self.detected = fallback
+        try:
+            os.write(sys.stdout.fileno(), data)
+        except OSError:
+            pass
+
+    def spawn(self, command: list[str], attempt: int) -> int:
+        baseline: dict[str, tuple[int, int]] = {}
+        for path in self.session_root().glob("*/*.jsonl"):
+            try:
+                stat = path.stat()
+                baseline[str(path)] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                pass
+        launched_at = time.time()
+        self.attempt_launched_at = launched_at
+        raw_path = self.sup_dir / f"attempt-{attempt}.raw.log"
+        self.detected = None
+        self.rollout = None
+        self.rollout_offset = 0
+        self.fallback_buffer = ""
+        self.attempt_started = time.monotonic()
+        self.rollout_touched = 0.0
+        self.completed_at = 0.0
+        self.completed = False
+        # A resumed thread inherits the previous attempt's subagent transcripts;
+        # re-observing them is what keeps their stale mtimes from reading as a
+        # live batch, so only the deferral notice resets per attempt.
+        self.completion_deferred = False
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execvpe(command[0], command, os.environ.copy())
+        self.child_pid, self.master_fd = pid, master
+        self.resize_child()
+        self.save(
+            status="running",
+            attempt=attempt,
+            child_pid=pid,
+            command=command,
+            launched_at=launched_at,
+            raw_log=str(raw_path),
+        )
+
+        expected = self.state.get("expected_session_id")
+        selector = selectors.DefaultSelector()
+        selector.register(master, selectors.EVENT_READ)
+        if sys.stdin.isatty():
+            selector.register(sys.stdin, selectors.EVENT_READ)
+        discovered = False
+        discovery_error: Exception | None = None
+        discovery_deadline = time.monotonic() + float(
+            os.environ.get("AGENT_SUPERVISOR_DISCOVERY_TIMEOUT", "45")
+        )
+        with raw_path.open("ab", buffering=0) as raw, self.combined_path.open(
+            "a", encoding="utf-8"
+        ) as combined:
+            while True:
+                self.timeout_reached()
+                if self.stop_path.exists():
+                    self.stop_requested = True
+                    self.terminate_child()
+                if not discovered and time.time() - launched_at > 0.25:
+                    try:
+                        path = self.discover_transcript(str(expected)) if expected else None
+                        if path:
+                            self.rollout = path
+                            self.rollout_offset = self.rollout_start(path, baseline)
+                            self.record_transcript(path)
+                            self.save(session_id=expected, rollout_path=str(path))
+                            discovered = True
+                        elif time.monotonic() >= discovery_deadline:
+                            raise RuntimeError(
+                                "could not discover the Claude transcript for this attempt"
+                            )
+                    except RuntimeError as exc:
+                        discovery_error = exc
+                        self.detected = "discovery_failed"
+                        self.terminate_child()
+                self.tail_rollout()
+                self.tail_subagents()
+                if self.detected:
+                    self.terminate_child()
+                elif (
+                    self.completed_at
+                    and not self.completed
+                    and complete_grace_seconds() > 0
+                    and time.monotonic() - self.completed_at >= complete_grace_seconds()
+                ):
+                    # Two separate questions. Is a batch outstanding? Counted
+                    # exactly, from the spawned agents whose
+                    # task-notification has not arrived -- transcripts that
+                    # merely exist are a batch already merged and must not hold the
+                    # run open. Is that batch still alive? Silence measured against
+                    # the far longer SUBAGENT_QUIET_SECONDS, because a live refiner
+                    # routinely says nothing for minutes. The second question only
+                    # bounds a batch that dies without reporting; the first is what
+                    # decides.
+                    subagents = self.outstanding_subagents()
+                    quiet = time.monotonic() - (
+                        self.subagent_touched or self.completed_at
+                    )
+                    if subagents and quiet < subagent_quiet_seconds():
+                        # An orchestrator ends its turn to wait for the batch it
+                        # just spawned. The turn is over but the run is not, so
+                        # keep the TUI up: stopping here would kill every live
+                        # window agent and still report a clean completion.
+                        if not self.completion_deferred:
+                            self.completion_deferred = True
+                            self.note(
+                                f"turn completed but {subagents} background agent"
+                                f"{'' if subagents == 1 else 's'} still active; "
+                                "holding the agent open"
+                            )
+                    else:
+                        # The turn ended cleanly and nothing followed: the TUI is
+                        # idle at its prompt and would sit there until the deadline.
+                        self.completed = True
+                        if subagents:
+                            # A batch was outstanding and went silent anyway. The
+                            # deliverable gate cannot show this -- scene.py writes
+                            # mesh/pose.json continuously -- so say it here, or the
+                            # truncated run stays indistinguishable from a finished
+                            # one, which is how this went unnoticed for two waves.
+                            self.state["subagent_batch_stale"] = subagents
+                            self.note(
+                                f"{subagents} background agent"
+                                f"{'' if subagents == 1 else 's'} never reported and "
+                                f"the batch has been silent {quiet:.0f}s (limit "
+                                f"{subagent_quiet_seconds():.0f}s); stopping the "
+                                "agent with the batch unmerged"
+                            )
+                        else:
+                            self.note("turn completed; stopping the idle agent")
+                        self.terminate_child()
+                for key, _ in selector.select(0.2):
+                    if key.fileobj == master:
+                        try:
+                            data = os.read(master, 65536)
+                        except OSError as exc:
+                            if exc.errno == errno.EIO:
+                                data = b""
+                            else:
+                                raise
+                        if data:
+                            self.process_output(data, raw, combined)
+                    else:
+                        try:
+                            data = os.read(sys.stdin.fileno(), 65536)
+                            if data:
+                                os.write(master, data)
+                        except OSError:
+                            pass
+                try:
+                    waited, status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    waited, status = pid, 0
+                if waited:
+                    self.child_pid = None
+                    self.tail_rollout()
+                    if discovery_error:
+                        self.note(str(discovery_error))
+                    return os.waitstatus_to_exitcode(status)
+
+    def rotate_thread(self, reason: str) -> int | None:
+        """Abandon the current thread. Only this operation spends rotations."""
+        rotations = int(self.state.get("rotations", 0)) + 1
+        if rotations > self.rotation_limit():
+            return None
+        self.state["rotations"] = rotations
+        if reason == "goal_stalled":
+            self.state["goal_stalls"] = int(self.state.get("goal_stalls", 0)) + 1
+            self.state["use_stall_prompt"] = True
+        else:
+            self.state["use_recovery_prompt"] = True
+            self.state.pop("use_stall_prompt", None)
+        self.state["consecutive_transient_failures"] = 0
+        self.state.pop("session_id", None)
+        self.state.pop("rollout_path", None)
+        self.state.pop("expected_session_id", None)
+        self.state.pop("resume_recovery_session_id", None)
+        self.state.pop("force_rotation_reason", None)
+        return rotations
+
+    def rotation_limit(self) -> int:
+        if self.rotation_limit_value is not None:
+            return self.rotation_limit_value
+        configured = self.args.max_rotations
+        if configured is None:
+            stored = self.state.get("max_rotations")
+            if isinstance(stored, int) and stored >= 0:
+                configured = stored
+        if configured is None:
+            configured = max_rotations()
+        if configured < 0:
+            raise SystemExit("--max-rotations must be >= 0")
+        self.rotation_limit_value = configured
+        return configured
+
+    def launcher_command(self) -> list[str]:
+        provider = str(self.state.get("claude_provider") or "anthropic")
+        return [
+            self.args.launcher,
+            "--run-dir",
+            str(self.run_dir),
+            "--claude-provider",
+            provider,
+        ]
+
+    def command(self, fresh: bool) -> list[str] | None:
+        command = self.launcher_command()
+        session_id = self.state.get("session_id")
+        force_rotation = self.state.get("force_rotation_reason")
+        if not fresh and session_id and force_rotation:
+            rotations = self.rotate_thread(str(force_rotation))
+            if rotations is None:
+                return None
+            self.note(
+                f"same-thread recovery did not hold; rotating to a fresh thread "
+                f"({rotations}/{self.rotation_limit()})"
+            )
+            fresh = True
+            session_id = None
+        if not fresh and session_id:
+            # An agent that stopped to ask gets the answer it needed -- carry on
+            # alone -- in the same session; an outage gets a plain continuation.
+            continuation = (
+                NUDGE_PROMPT
+                if self.state.get("failure") == "awaiting_input"
+                else CONTINUATION_PROMPT
+            )
+            command.extend(["--resume", str(session_id), continuation])
+            self.state["expected_session_id"] = session_id
+            if self.state.get("failure") in RECOVERABLE_FAILURES:
+                self.state["resume_recovery_session_id"] = session_id
+        else:
+            if self.state.pop("use_stall_prompt", False):
+                prompt = stall_prompt(self.run_dir)
+            elif self.state.get("use_recovery_prompt"):
+                prompt = recovery_prompt(self.run_dir)
+            else:
+                prompt = self.state.get("original_prompt") or recovery_prompt(self.run_dir)
+            # Choosing the id here is what makes the transcript findable by name
+            # the moment Claude Code creates it.
+            session_id = str(uuid.uuid4())
+            command.extend(["--session-id", session_id, prompt])
+            self.state["expected_session_id"] = session_id
+            self.state["session_id"] = session_id
+        return command
+
+    def run(self) -> int:
+        self.acquire_lock()
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, self.handle_signal)
+        signal.signal(signal.SIGWINCH, self.resize_child)
+        if sys.stdin.isatty():
+            original_termios = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+            atexit.register(
+                termios.tcsetattr,
+                sys.stdin.fileno(),
+                termios.TCSADRAIN,
+                original_termios,
+            )
+
+        configured_gpus = self.args.gpus or str(self.state.get("gpus", ""))
+        if not configured_gpus:
+            config = read_json(self.run_dir / "run_config.json")
+            pool = config.get("pool", {})
+            gpu_values = pool.get("gpus", []) if isinstance(pool, dict) else []
+            if isinstance(gpu_values, list):
+                configured_gpus = ",".join(str(value) for value in gpu_values)
+        if configured_gpus:
+            os.environ["SANDBOX_GPUS"] = configured_gpus
+        configured_provider = (
+            self.args.claude_provider
+            or str(self.state.get("claude_provider", ""))
+            or "anthropic"
+        )
+        if configured_provider not in {"anthropic"}:
+            raise SystemExit(
+                f"--claude-provider must be anthropic, got "
+                f"{configured_provider!r}"
+            )
+        configured_max_attempts = self.args.max_attempts
+        if configured_max_attempts is None:
+            stored_max_attempts = self.state.get("max_attempts")
+            if isinstance(stored_max_attempts, int) and stored_max_attempts >= 1:
+                configured_max_attempts = stored_max_attempts
+        if configured_max_attempts is None:
+            configured_max_attempts = max_total_attempts()
+        if configured_max_attempts < 1:
+            raise SystemExit("--max-attempts must be >= 1")
+        configured_timeout_hours = self.args.timeout_hours
+        if configured_timeout_hours is not None:
+            if (not math.isfinite(configured_timeout_hours)
+                    or configured_timeout_hours <= 0):
+                raise SystemExit("--timeout-hours must be a positive finite number")
+            deadline_at = time.time() + configured_timeout_hours * 3600.0
+            self.state.pop("timeout_reached", None)
+            self.state.pop("timeout_reason", None)
+        else:
+            stored_timeout = self.state.get("timeout_hours")
+            stored_deadline = self.state.get("deadline_at")
+            if (isinstance(stored_timeout, (int, float))
+                    and math.isfinite(stored_timeout)
+                    and stored_timeout > 0
+                    and isinstance(stored_deadline, (int, float))
+                    and math.isfinite(stored_deadline)):
+                configured_timeout_hours = float(stored_timeout)
+                deadline_at = float(stored_deadline)
+            else:
+                configured_timeout_hours = None
+                deadline_at = None
+        configured_max_rotations = self.rotation_limit()
+        prior_attempts = int(self.state.get("attempt", 0))
+        self.state.update(
+            run_dir=str(self.run_dir),
+            tmux_session=self.args.tmux_session,
+            launcher=self.args.launcher,
+            agent="claude",
+            claude_provider=configured_provider,
+            gpus=configured_gpus,
+            max_attempts=configured_max_attempts,
+            max_rotations=configured_max_rotations,
+            timeout_hours=configured_timeout_hours,
+            deadline_at=deadline_at,
+            original_prompt=self.args.prompt or self.state.get("original_prompt"),
+            consecutive_transient_failures=0,
+            rotations=int(self.state.get("rotations", 0)),
+            supervisor_pid=os.getpid(),
+            started_at=time.time(),
+        )
+        if self.args.fresh:
+            self.state["use_recovery_prompt"] = False
+            self.state["goal_stalls"] = 0
+            self.state["rotations"] = 0
+            self.state.pop("use_stall_prompt", None)
+            self.state.pop("session_id", None)
+            self.state.pop("rollout_path", None)
+            self.state.pop("expected_session_id", None)
+            self.state.pop("resume_recovery_session_id", None)
+            self.state.pop("force_rotation_reason", None)
+        fresh = self.args.fresh or not self.state.get("session_id")
+        self.save(status="starting")
+
+        while not self.stop_requested:
+            self.timeout_reached()
+            if self.stop_requested:
+                break
+            attempt = prior_attempts + 1
+            prior_attempts = attempt
+            command = self.command(fresh)
+            fresh = False
+            if command is None:
+                failure = str(
+                    self.state.get("force_rotation_reason")
+                    or self.state.get("failure")
+                    or "rotation_limit"
+                )
+                self.save(status="failed", failure=failure)
+                self.note(
+                    f"stopping after {configured_max_rotations} thread rotations: the run "
+                    "needs a human"
+                )
+                return 1
+            self.note(f"starting attempt {attempt}: {shlex.join(command[:-1])}")
+            exit_code = self.spawn(command, attempt)
+            failure = self.detected
+            elapsed = time.monotonic() - self.attempt_started
+            if self.stop_requested:
+                exit_code = 124 if self.state.get("timeout_reached") else exit_code
+                self.save(status="stopped", exit_code=exit_code)
+                return exit_code if exit_code == 124 else 130
+            if self.completed and not failure:
+                # The supervisor stopped the idle TUI itself, so the child's exit
+                # status is the signal it was sent, not a verdict on the run.
+                self.save(status="exited", exit_code=0, child_pid=None, completed=True)
+                self.note("agent completed its turn; run finished")
+                return 0
+            if not failure:
+                if exit_code not in (0, 129, 130, 143):
+                    failure = "transient"
+                    self.note(f"agent process died with status {exit_code}")
+                else:
+                    self.save(status="exited", exit_code=exit_code, child_pid=None)
+                    self.note(f"agent exited with status {exit_code}; not restarting")
+                    return exit_code
+            recovery_session = self.state.get("resume_recovery_session_id")
+            if recovery_session and elapsed >= progress_seconds():
+                self.note(
+                    f"same-thread recovery for {recovery_session} made "
+                    f"{elapsed:.0f}s of progress"
+                )
+                self.state.pop("resume_recovery_session_id", None)
+                recovery_session = None
+            elif (
+                recovery_session
+                and failure in RECOVERABLE_FAILURES
+                and failure not in SAME_SESSION_FAILURES
+            ):
+                # A resume that promptly re-hits throttling is the expected
+                # shape of a shared window still closed -- the thread is fine,
+                # so it never spends a rotation. Anything else re-dying this
+                # fast means the same-thread recovery did not hold.
+                self.state["force_rotation_reason"] = failure
+            if failure in FATAL_FAILURES:
+                self.save(status="failed", failure=failure, exit_code=exit_code)
+                self.note(f"stopping after non-recoverable failure: {failure}")
+                return 1
+            if failure == "unclassified":
+                # The classifier will always trail the API's vocabulary, so the
+                # default has to be to retry.
+                # Resuming is cheap, and a failed resume falls through to the
+                # bounded rotation path. It stays *named* unclassified in the
+                # state file, so these are still findable and can be given a
+                # pattern.
+                self.note(
+                    "unrecognised failure text; retrying on the transient ladder"
+                )
+            if failure in IMMEDIATE_ROTATION_FAILURES:
+                rotations = self.rotate_thread(failure)
+                if rotations is None:
+                    self.save(status="failed", failure=failure)
+                    self.note(
+                        f"stopping after {configured_max_rotations} thread rotations: "
+                        "the run needs a human"
+                    )
+                    return 1
+                fresh = True
+                self.note(
+                    f"{failure.replace('_', ' ')}; rotating to a fresh thread "
+                    f"({rotations}/{configured_max_rotations})"
+                )
+                continue
+            if failure == "goal_stalled":
+                rotations = self.rotate_thread(failure)
+                if rotations is None:
+                    self.save(status="failed", failure=failure)
+                    self.note(
+                        f"stopping after {configured_max_rotations} thread rotations: "
+                        "the run needs a human"
+                    )
+                    return 1
+                fresh = True
+                self.save(status="backoff", failure=failure)
+                self.note(
+                    f"goal stalled; rotating to a fresh thread with a new goal "
+                    f"({rotations}/{configured_max_rotations})"
+                )
+                continue
+
+            if attempt >= configured_max_attempts:
+                self.save(status="failed", failure=failure)
+                self.note(f"stopping after {attempt} total attempts for this run")
+                return 1
+            if failure in THROTTLE_FAILURES:
+                # Resume the exact thread: throttling costs nothing of the
+                # thread's context, so there is nothing to rotate away from.
+                # A usage limit gets its own, longer ladder -- it is the
+                # account's time window, and a fresh thread hits it just the
+                # same, so waiting it out is the only move that helps.
+                counter = f"{failure.removesuffix('ed')}s"
+                limits = int(self.state.get(counter, 0)) + 1
+                self.state[counter] = limits
+                ladder = (
+                    usage_limit_backoff()
+                    if failure == "usage_limited"
+                    else rate_limit_backoff()
+                )
+                delay = ladder[min(limits, len(ladder)) - 1]
+                self.save(status="backoff", failure=failure, retry_in=delay)
+                self.note(
+                    f"{failure.replace('_', ' ')} ({limits}); resuming exact "
+                    f"thread in {delay}s"
+                )
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline and not self.stop_requested:
+                    self.timeout_reached()
+                    if self.stop_path.exists():
+                        self.stop_requested = True
+                        break
+                    time.sleep(min(0.25, deadline - time.monotonic()))
+                continue
+            prior = int(self.state.get("consecutive_transient_failures", 0))
+            if prior and elapsed >= progress_seconds():
+                self.note(
+                    f"attempt {attempt} ran {elapsed:.0f}s before failing; "
+                    f"clearing {prior} earlier consecutive failure(s)"
+                )
+                prior = 0
+            failures = prior + 1
+            self.state["consecutive_transient_failures"] = failures
+            delay = backoff()[min(failures, len(backoff())) - 1]
+            self.save(status="backoff", failure=failure, retry_in=delay)
+            if self.state.get("force_rotation_reason"):
+                self.note(
+                    f"transient failure; same-thread recovery did not hold, "
+                    f"rotating to a fresh thread in {delay}s"
+                )
+            elif failure == "awaiting_input":
+                self.note(f"agent stopped to ask; nudging the same session in {delay}s")
+            else:
+                self.note(f"transient failure; resuming exact thread in {delay}s")
+            deadline = time.monotonic() + delay
+            while time.monotonic() < deadline and not self.stop_requested:
+                self.timeout_reached()
+                if self.stop_path.exists():
+                    self.stop_requested = True
+                    break
+                time.sleep(min(0.25, deadline - time.monotonic()))
+        exit_code = 124 if self.state.get("timeout_reached") else 130
+        self.save(status="stopped", exit_code=exit_code)
+        return exit_code
+
+
+def progress_seconds() -> float:
+    override = os.environ.get("AGENT_SUPERVISOR_PROGRESS_SECONDS")
+    if not override:
+        return PROGRESS_SECONDS
+    try:
+        return float(override)
+    except ValueError:
+        return PROGRESS_SECONDS
+
+
+def complete_grace_seconds() -> float:
+    override = os.environ.get("AGENT_SUPERVISOR_COMPLETE_GRACE_SECONDS")
+    if not override:
+        return COMPLETE_GRACE_SECONDS
+    try:
+        return float(override)
+    except ValueError:
+        return COMPLETE_GRACE_SECONDS
+
+
+def subagent_quiet_seconds() -> float:
+    override = os.environ.get("AGENT_SUPERVISOR_SUBAGENT_QUIET_SECONDS")
+    if not override:
+        return SUBAGENT_QUIET_SECONDS
+    try:
+        return float(override)
+    except ValueError:
+        return SUBAGENT_QUIET_SECONDS
+
+
+def max_total_attempts() -> int:
+    override = os.environ.get("AGENT_SUPERVISOR_MAX_ATTEMPTS")
+    if not override:
+        return MAX_TOTAL_ATTEMPTS
+    try:
+        return int(override)
+    except ValueError:
+        return MAX_TOTAL_ATTEMPTS
+
+
+def backoff() -> tuple[float, ...]:
+    override = os.environ.get("AGENT_SUPERVISOR_BACKOFF")
+    if not override:
+        return BACKOFF
+    try:
+        values = tuple(float(item) for item in override.split(","))
+    except ValueError:
+        return BACKOFF
+    return values or BACKOFF
+
+
+def max_rotations() -> int:
+    override = os.environ.get("AGENT_SUPERVISOR_MAX_ROTATIONS")
+    if not override:
+        # Compatibility with deployments that configured the old stall limit.
+        override = os.environ.get("AGENT_SUPERVISOR_MAX_GOAL_STALLS")
+    if not override:
+        return MAX_ROTATIONS
+    try:
+        return int(override)
+    except ValueError:
+        return MAX_ROTATIONS
+
+
+def rate_limit_backoff() -> tuple[float, ...]:
+    """Throttling ladder. The last step repeats, so the wait never shortens."""
+    override = os.environ.get("AGENT_SUPERVISOR_RATE_LIMIT_BACKOFF")
+    if not override:
+        return RATE_LIMIT_BACKOFF
+    try:
+        values = tuple(float(item) for item in override.split(","))
+    except ValueError:
+        return RATE_LIMIT_BACKOFF
+    return values or RATE_LIMIT_BACKOFF
+
+
+def usage_limit_backoff() -> tuple[float, ...]:
+    """Usage-window ladder. The last step repeats, so the wait never shortens."""
+    override = os.environ.get("AGENT_SUPERVISOR_USAGE_LIMIT_BACKOFF")
+    if not override:
+        return USAGE_LIMIT_BACKOFF
+    try:
+        values = tuple(float(item) for item in override.split(","))
+    except ValueError:
+        return USAGE_LIMIT_BACKOFF
+    return values or USAGE_LIMIT_BACKOFF
+
+
+def tmux_exists(name: str) -> bool:
+    return subprocess.run(
+        ["tmux", "has-session", "-t", f"={name}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+def attach(name: str) -> int:
+    if os.environ.get("TMUX"):
+        return subprocess.call(["tmux", "switch-client", "-t", f"={name}"])
+    return subprocess.call(["tmux", "attach-session", "-t", f"={name}"])
+
+
+def start(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    if not run_dir.is_dir():
+        raise SystemExit(f"run directory not found: {run_dir}")
+    if not (run_dir / "layout.json").is_file():
+        raise SystemExit(f"not a reconstruction run (layout.json missing): {run_dir}")
+    name = session_name(run_dir)
+    script = str(Path(__file__).resolve())
+    command = [
+        script,
+        "_supervise",
+        "--run-dir",
+        str(run_dir),
+        "--launcher",
+        str(Path(args.launcher).resolve()),
+        "--tmux-session",
+        name,
+    ]
+    if args.gpus:
+        command.extend(["--gpus", args.gpus])
+    if args.claude_provider:
+        command.extend(["--claude-provider", args.claude_provider])
+    if args.max_attempts is not None:
+        if args.max_attempts < 1:
+            raise SystemExit("--max-attempts must be >= 1")
+        command.extend(["--max-attempts", str(args.max_attempts)])
+    if args.max_rotations is not None:
+        if args.max_rotations < 0:
+            raise SystemExit("--max-rotations must be >= 0")
+        command.extend(["--max-rotations", str(args.max_rotations)])
+    if args.timeout_hours is not None:
+        if (not math.isfinite(args.timeout_hours)
+                or args.timeout_hours <= 0):
+            raise SystemExit("--timeout-hours must be a positive finite number")
+        command.extend(["--timeout-hours", str(args.timeout_hours)])
+    if args.prompt:
+        # tmux refuses a command string past ~16 KB ("command too long"), and a
+        # run over every frame of a long capture carries the frame list twice in
+        # its prompt. Hand the prompt over by file; state.json still records it
+        # as original_prompt.
+        prompt_dir = run_dir / "supervisor"
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        prompt_path = prompt_dir / f"prompt-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        prompt_path.write_text(args.prompt, encoding="utf-8")
+        command.extend(["--prompt-file", str(prompt_path)])
+    if args.fresh:
+        command.append("--fresh")
+    shell_command = shlex.join(command)
+
+    if tmux_exists(name):
+        state = read_json(run_dir / "supervisor/state.json")
+        if state.get("status") in {"running", "starting", "backoff", "stopping"}:
+            print(f"supervisor already active in tmux session {name}")
+            return 0 if args.detach else attach(name)
+        if args.invocation != "resume":
+            raise SystemExit(
+                f"tmux session {name} is retained for inspection; use --resume-run"
+            )
+        window = f"resume-{int(state.get('attempt', 0)) + 1}"
+        subprocess.run(
+            [
+                "tmux",
+                "new-window",
+                "-d",
+                "-t",
+                f"={name}",
+                "-n",
+                window,
+                shell_command,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "tmux",
+                "set-window-option",
+                "-t",
+                f"={name}:{window}",
+                "remain-on-exit",
+                "on",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"={name}:{window}"], check=True
+        )
+    else:
+        subprocess.run(
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-n",
+                "supervisor",
+                shell_command,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "tmux",
+                "set-window-option",
+                "-t",
+                f"={name}:supervisor",
+                "remain-on-exit",
+                "on",
+            ],
+            check=True,
+        )
+    print(f"Supervisor tmux session: {name}")
+    print(f"Logs: {run_dir / 'supervisor/combined.log'}")
+    return 0 if args.detach else attach(name)
+
+
+def status(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    state = read_json(run_dir / "supervisor/state.json")
+    if not state:
+        print(f"no supervisor state for {run_dir}")
+        return 1
+    print(json.dumps(state, indent=2, sort_keys=True))
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run_dir).resolve()
+    sup_dir = run_dir / "supervisor"
+    sup_dir.mkdir(exist_ok=True)
+    (sup_dir / "stop").touch()
+    state = read_json(sup_dir / "state.json")
+    name = state.get("tmux_session") or session_name(run_dir)
+    if tmux_exists(name):
+        subprocess.run(["tmux", "send-keys", "-t", f"={name}", "C-c"], check=False)
+    print(f"stop requested for {name}")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="action", required=True)
+    for action in ("start", "resume"):
+        item = sub.add_parser(action)
+        item.add_argument("--run-dir", required=True)
+        item.add_argument("--launcher", required=True)
+        item.add_argument("--gpus", default="")
+        item.add_argument(
+            "--claude-provider", choices=("anthropic",), default=""
+        )
+        item.add_argument("--max-attempts", type=int)
+        item.add_argument("--max-rotations", type=int)
+        item.add_argument("--timeout-hours", type=float)
+        item.add_argument("--prompt")
+        item.add_argument("--detach", action="store_true")
+        item.set_defaults(
+            func=start, fresh=action == "start", invocation=action
+        )
+    for action, func in (("status", status), ("attach", None), ("stop", stop)):
+        item = sub.add_parser(action)
+        item.add_argument("--run-dir", required=True)
+        if action == "attach":
+            item.set_defaults(
+                func=lambda args: attach(session_name(Path(args.run_dir).resolve()))
+            )
+        else:
+            item.set_defaults(func=func)
+    internal = sub.add_parser("_supervise", help=argparse.SUPPRESS)
+    internal.add_argument("--run-dir", required=True)
+    internal.add_argument("--launcher", required=True)
+    internal.add_argument("--tmux-session", required=True)
+    internal.add_argument("--gpus", default="")
+    internal.add_argument(
+        "--claude-provider", choices=("anthropic",), default=""
+    )
+    internal.add_argument("--max-attempts", type=int)
+    internal.add_argument("--max-rotations", type=int)
+    internal.add_argument("--timeout-hours", type=float)
+    internal.add_argument("--prompt")
+    internal.add_argument("--prompt-file")
+    internal.add_argument("--fresh", action="store_true")
+    internal.set_defaults(func=supervise)
+    return result
+
+
+def supervise(args: argparse.Namespace) -> int:
+    if not args.prompt and getattr(args, "prompt_file", None):
+        args.prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    return Supervisor(args).run()
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

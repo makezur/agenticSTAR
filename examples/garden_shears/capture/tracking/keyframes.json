@@ -1,0 +1,134 @@
+[
+  {
+    "view": 0,
+    "frame_index": 0,
+    "frame_name": "000000.jpg",
+    "time_s": 0.0
+  },
+  {
+    "view": 1,
+    "frame_index": 5,
+    "frame_name": "000005.jpg",
+    "time_s": 0.1667
+  },
+  {
+    "view": 2,
+    "frame_index": 10,
+    "frame_name": "000010.jpg",
+    "time_s": 0.3333
+  },
+  {
+    "view": 3,
+    "frame_index": 15,
+    "frame_name": "000015.jpg",
+    "time_s": 0.5
+  },
+  {
+    "view": 4,
+    "frame_index": 20,
+    "frame_name": "000020.jpg",
+    "time_s": 0.6667
+  },
+  {
+    "view": 5,
+    "frame_index": 25,
+    "frame_name": "000025.jpg",
+    "time_s": 0.8333
+  },
+  {
+    "view": 6,
+    "frame_index": 30,
+    "frame_name": "000030.jpg",
+    "time_s": 1.0
+  },
+  {
+    "view": 7,
+    "frame_index": 35,
+    "frame_name": "000035.jpg",
+    "time_s": 1.1667
+  },
+  {
+    "view": 8,
+    "frame_index": 40,
+    "frame_name": "000040.jpg",
+    "time_s": 1.3333
+  },
+  {
+    "view": 9,
+    "frame_index": 45,
+    "frame_name": "000045.jpg",
+    "time_s": 1.5
+  },
+  {
+    "view": 10,
+    "frame_index": 50,
+    "frame_name": "000050.jpg",
+    "time_s": 1.6667
+  },
+  {
+    "view": 11,
+    "frame_index": 55,
+    "frame_name": "000055.jpg",
+    "time_s": 1.8333
+  },
+  {
+    "view": 12,
+    "frame_index": 60,
+    "frame_name": "000060.jpg",
+    "time_s": 2.0
+  },
+  {
+    "view": 13,
+    "frame_index": 65,
+    "frame_name": "000065.jpg",
+    "time_s": 2.1667
+  },
+  {
+    "view": 14,
+    "frame_index": 70,
+    "frame_name": "000070.jpg",
+    "time_s": 2.3333
+  },
+  {
+    "view": 15,
+    "frame_index": 75,
+    "frame_name": "000075.jpg",
+    "time_s": 2.5
+  },
+  {
+    "view": 16,
+    "frame_index": 80,
+    "frame_name": "000080.jpg",
+    "time_s": 2.6667
+  },
+  {
+    "view": 17,
+    "frame_index": 85,
+    "frame_name": "000085.jpg",
+    "time_s": 2.8333
+  },
+  {
+    "view": 18,
+    "frame_index": 90,
+    "frame_name": "000090.jpg",
+    "time_s": 3.0
+  },
+  {
+    "view": 19,
+    "frame_index": 95,
+    "frame_name": "000095.jpg",
+    "time_s": 3.1667
+  },
+  {
+    "view": 20,
+    "frame_index": 100,
+    "frame_name": "000100.jpg",
+    "time_s": 3.3333
+  },
+  {
+    "view": 21,
+    "frame_index": 105,
+    "frame_name": "000105.jpg",
+    "time_s": 3.5
+  }
+]

@@ -1,0 +1,48 @@
+# Run outputs
+runs/
+
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Logs and temp
+*.log
+*.tmp
+tmp/
+
+# Dataset captures (materialized sequences)
+captures/
+
+# Release additions
+# yyfz/Pi3 checkout (tools/install_pi3x.sh)
+third_party/
+# working notes, not shipped
+PLAN.md
+
+# Tests stay local (run them, don't ship them)
+tests/
+**/tests/
+**/*_test.py
+harness/conftest.py

@@ -1,0 +1,6 @@
+{
+  "_comment": "An explicit measured pinhole K for the fixed camera-0. Pass with: harness/render.sh scene.py out/ --views match --camera-json examples/camera_example.json. The harness renders from a FIXED camera-0 (identity extrinsic) and moves the OBJECT to match the photo, so ONLY intrinsics are read here — a non-identity 'pose' is rejected. Express viewpoint via the object pose in scene.py, not a camera extrinsic.",
+
+  "intrinsics": { "fx": 900.0, "fy": 900.0, "cx": 400.0, "cy": 300.0, "width": 800, "height": 600 },
+  "_intrinsics_notes": "Pinhole K in pixels. fx!=fy and an off-center principal point (cx,cy) are honored. width,height is the grid the K was measured on (the default render canvas); the K is rescaled to whatever resolution is actually rendered (e.g. via --match-res). Sanity-check with --debug-project x,y,z."
+}

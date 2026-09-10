@@ -1,0 +1,21 @@
+# Micromamba env for tools/make_capture.py (Pi3X camera + pointmap estimation).
+# Separate from `artscript` on purpose: the harness env is torch-free, and Pi3
+# pins numpy 1.26. Create it with tools/install_pi3x.sh (which also clones the
+# yyfz/Pi3 checkout and prefetches the yyfz233/Pi3X weights), or by hand:
+#   micromamba create -y -f tools/pi3x_env.yml
+#   micromamba run -n pi3x pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+#   micromamba run -n pi3x pip install --no-deps -e third_party/Pi3
+name: pi3x
+channels: [conda-forge]
+dependencies:
+  - python=3.12
+  - pip
+  - setuptools<81
+  - pip:
+    - numpy==1.26.4
+    - opencv-python-headless<5
+    - pillow
+    - plyfile==1.1.3
+    - einops
+    - safetensors
+    - huggingface_hub

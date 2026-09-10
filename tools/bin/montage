@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LD_LIBRARY_PATH="/opt/mamba/envs/artscript/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export MAGICK_CONFIGURE_PATH="/opt/mamba/envs/artscript/etc/ImageMagick-7"
+export FONTCONFIG_FILE="/etc/fonts/fonts.conf"
+export FONTCONFIG_PATH="/etc/fonts"
+exec /opt/mamba/envs/artscript/bin/magick montage "$@"

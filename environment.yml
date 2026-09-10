@@ -1,0 +1,19 @@
+# Micromamba env for the harness's OUT-OF-BLENDER tooling only.
+# Blender (4.2.5 LTS, install_blender.sh) uses its OWN bundled Python 3.11 for
+# bpy — this env is for compositing, scoring and mesh validation.
+#   micromamba create -y -f environment.yml
+#   micromamba run -n artscript env PYTHONPATH=harness python -m analysis.viz.composite ...
+# Pi3X (tools/make_capture.py) has its own env: tools/pi3x_env.yml.
+name: artscript
+channels: [conda-forge]
+dependencies:
+  - python=3.11
+  - numpy
+  - pillow
+  - opencv        # side-by-side panel + silhouette overlay
+  - imagemagick   # montage/magick/convert for agent-authored image inspection
+  - trimesh       # watertight / manifold / volume checks
+  - scipy         # trimesh convex hull / PointCloud (tools/hull_preview.py)
+  - pip
+  - pip:
+    - manifold3d  # boolean + watertight backend for trimesh (pip only)

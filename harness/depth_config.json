@@ -1,0 +1,6 @@
+{
+  "_comment": "Per-backend depth defaults. `conf_thr` is the confidence FLOOR: at scoring time (analysis/scorers/depth.py, views/sweeps via core/depth_config.py) a depth pixel with confidence BELOW it is hard-dropped from the depth score; survivors are still soft-weighted by their confidence. `weight` is the default sweep depth-supervision weight (combined = gate IoU - weight * min(depth_canon, 1)); an explicit --sweep-depth-weight / order depth_weight always wins. run.sh copies the chosen backend's values into RUN_DIR/depth_config.json ({backend, conf_thr, weight, cost, report, render}) at scaffold; the scorers/sweeps auto-resolve that per-run file (walking up from the render/out path). Missing file -> core.depth_config defaults. Estimated depth (pi3x) is noisy, so it keeps the 0.1 floor and defaults to weight 0.0: it is scored/panelled (see `report`) without steering the sweep unless an order states a weight.",
+  "backends": {
+    "pi3x": {"conf_thr": 0.1, "weight": 0.0}
+  }
+}

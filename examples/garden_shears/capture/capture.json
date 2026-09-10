@@ -1,0 +1,47 @@
+{
+  "format": "capture/v1",
+  "dataset": "pi3x",
+  "source": {
+    "producer": "tools/make_capture.py",
+    "src": "examples/garden_shears/input",
+    "pi3x_model": "yyfz233/Pi3X",
+    "pi3x_size": [
+      378,
+      658
+    ],
+    "hand_masks": true,
+    "name": "garden_shears"
+  },
+  "downscale": 1.0,
+  "undistorted": false,
+  "depth": "none",
+  "image_size": [
+    380,
+    658
+  ],
+  "frames": [
+    "000000.jpg",
+    "000005.jpg",
+    "000010.jpg",
+    "000015.jpg",
+    "000020.jpg",
+    "000025.jpg",
+    "000030.jpg",
+    "000035.jpg",
+    "000040.jpg",
+    "000045.jpg",
+    "000050.jpg",
+    "000055.jpg",
+    "000060.jpg",
+    "000065.jpg",
+    "000070.jpg",
+    "000075.jpg",
+    "000080.jpg",
+    "000085.jpg",
+    "000090.jpg",
+    "000095.jpg",
+    "000100.jpg",
+    "000105.jpg"
+  ],
+  "ref_frame": "000000.jpg"
+}

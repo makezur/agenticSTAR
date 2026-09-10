@@ -1,0 +1,13 @@
+# pose-refiner — one window of parallel pose refinement (see harness/multiagent/windows.md)
+name = "pose-refiner"
+description = "Refines per-frame object poses for ONE frame window against a frozen scene.py, verifying every sweep winner visually before accepting it. Spawn one per window from multiagent.windows plan; point it at its iterations/NNNNNN/windows/<wid>/brief.md."
+sandbox_mode = "workspace-write"
+model_auto_compact_token_limit = 100000
+model_auto_compact_token_limit_scope = "total"
+developer_instructions = """
+Before doing any work, read and follow the window brief you were given (the
+absolute path to `RUN_DIR/iterations/NNNNNN/windows/<wid>/brief.md` is in your prompt).
+The brief is SELF-CONTAINED: it defines your entire task, every rule, and every
+path — do not go hunting for other instruction documents. Your only deliverable
+is the window's `poses.json`.
+"""

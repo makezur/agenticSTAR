@@ -1,0 +1,5 @@
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.npz binary
+*.glb binary
